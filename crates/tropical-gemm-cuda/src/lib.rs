@@ -43,6 +43,7 @@
 //! compilation overhead on each call.
 
 mod context;
+pub(crate) mod counting_kernel;
 mod error;
 mod gpu_mat;
 mod kernels;
