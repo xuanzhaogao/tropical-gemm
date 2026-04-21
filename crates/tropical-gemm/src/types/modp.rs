@@ -70,6 +70,48 @@ impl<const P: i32> fmt::Display for Mod<P> {
     }
 }
 
+impl<const P: i32> crate::types::scalar::TropicalScalar for Mod<P> {
+    #[inline(always)]
+    fn scalar_zero() -> Self {
+        Self(0)
+    }
+
+    #[inline(always)]
+    fn scalar_one() -> Self {
+        Self(1)
+    }
+
+    #[inline(always)]
+    fn scalar_add(self, rhs: Self) -> Self {
+        Mod::add(self, rhs)
+    }
+
+    #[inline(always)]
+    fn scalar_mul(self, rhs: Self) -> Self {
+        Mod::mul(self, rhs)
+    }
+
+    #[inline(always)]
+    fn pos_infinity() -> Self {
+        unreachable!("Mod<P> is a count scalar, not a tropical value — pos_infinity is undefined")
+    }
+
+    #[inline(always)]
+    fn neg_infinity() -> Self {
+        unreachable!("Mod<P> is a count scalar, not a tropical value — neg_infinity is undefined")
+    }
+
+    #[inline(always)]
+    fn scalar_max(self, _rhs: Self) -> Self {
+        unreachable!("Mod<P> is a count scalar, not a tropical value — scalar_max is undefined")
+    }
+
+    #[inline(always)]
+    fn scalar_min(self, _rhs: Self) -> Self {
+        unreachable!("Mod<P> is a count scalar, not a tropical value — scalar_min is undefined")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,5 +185,42 @@ mod tests {
     fn default_is_zero() {
         let d = Mod::<P>::default();
         assert_eq!(d.raw(), 0);
+    }
+
+    #[test]
+    fn tropical_scalar_impl_plugs_into_counting_tropical() {
+        use super::super::counting::CountingTropical;
+        use super::super::direction::Max;
+        use super::super::traits::TropicalSemiring;
+
+        // Sanity: we can construct CountingTropical<f32, Mod<7>, Max>.
+        let a: CountingTropical<f32, Mod<7>, Max> = CountingTropical::new(3.0, Mod::new(2));
+        let b: CountingTropical<f32, Mod<7>, Max> = CountingTropical::new(5.0, Mod::new(4));
+        let c = a.tropical_mul(b);
+        assert_eq!(c.value, 8.0);            // 3.0 + 5.0
+        assert_eq!(c.count.raw(), 1);        // (2 * 4) mod 7 = 1
+    }
+
+    #[test]
+    fn scalar_add_matches_manual_mod() {
+        use super::super::scalar::TropicalScalar;
+        let a = Mod::<7>::new(5);
+        let b = Mod::<7>::new(4);
+        assert_eq!(a.scalar_add(b).raw(), 2);
+    }
+
+    #[test]
+    fn scalar_mul_matches_manual_mod() {
+        use super::super::scalar::TropicalScalar;
+        let a = Mod::<7>::new(5);
+        let b = Mod::<7>::new(4);
+        assert_eq!(a.scalar_mul(b).raw(), 6);
+    }
+
+    #[test]
+    fn scalar_zero_and_one() {
+        use super::super::scalar::TropicalScalar;
+        assert_eq!(Mod::<7>::scalar_zero().raw(), 0);
+        assert_eq!(Mod::<7>::scalar_one().raw(), 1);
     }
 }
