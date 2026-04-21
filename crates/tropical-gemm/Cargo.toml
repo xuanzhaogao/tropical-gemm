@@ -16,6 +16,8 @@ parallel = ["rayon"]
 
 [dependencies]
 num-traits = { workspace = true }
+num-bigint = "0.4"
+num-integer = "0.1"
 rayon = { workspace = true, optional = true }
 wide = { workspace = true }
 
