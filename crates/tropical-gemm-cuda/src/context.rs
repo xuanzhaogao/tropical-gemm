@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 /// CUDA kernel source code.
 const KERNEL_SOURCE: &str = include_str!("../kernels/tropical_gemm.cu");
+const COUNTING_KERNEL_SOURCE: &str = include_str!("../kernels/counting_gemm.cu");
 
 /// Blocking parameters for f32 kernels.
 pub const BLOCK_SIZE_M_F32: u32 = 64;
@@ -63,6 +64,14 @@ const KERNEL_NAMES: &[&str] = &[
     "tropical_maxmul_f32_nn_batched_with_argmax",
 ];
 
+/// Counting GEMM kernel function names (spec C).
+const COUNTING_KERNEL_NAMES: &[&str] = &[
+    "counting_gemm_f32_max",
+    "counting_gemm_f32_min",
+    "counting_gemm_f64_max",
+    "counting_gemm_f64_min",
+];
+
 /// CUDA context for tropical GEMM operations.
 ///
 /// Manages device selection, kernel compilation, and caching.
@@ -91,11 +100,21 @@ impl CudaContext {
         // Load PTX module
         device.load_ptx(ptx, "tropical_gemm", KERNEL_NAMES)?;
 
+        // Compile + load counting GEMM kernels (spec C).
+        let counting_ptx = cudarc::nvrtc::compile_ptx(COUNTING_KERNEL_SOURCE)?;
+        device.load_ptx(counting_ptx, "counting_gemm", COUNTING_KERNEL_NAMES)?;
+
         // Cache kernel functions
         let mut kernels = HashMap::new();
         for name in KERNEL_NAMES {
             let func = device
                 .get_func("tropical_gemm", name)
+                .ok_or_else(|| CudaError::KernelNotFound(name.to_string()))?;
+            kernels.insert(*name, func);
+        }
+        for name in COUNTING_KERNEL_NAMES {
+            let func = device
+                .get_func("counting_gemm", name)
                 .ok_or_else(|| CudaError::KernelNotFound(name.to_string()))?;
             kernels.insert(*name, func);
         }
@@ -147,5 +166,18 @@ impl CudaContext {
         let bszm = BLOCK_SIZE_M_F64 / THREAD_SIZE_M;
         let bszn = BLOCK_SIZE_N_F64 / THREAD_SIZE_N;
         (bszm, bszn, 1)
+    }
+
+    /// Block dimensions for counting kernels.
+    pub fn counting_block_dims() -> (u32, u32, u32) {
+        (16, 16, 1)
+    }
+
+    /// Grid dimensions for a counting kernel launch covering m x n output cells.
+    pub fn counting_grid_dims(m: usize, n: usize) -> (u32, u32, u32) {
+        let (bx, by, _) = Self::counting_block_dims();
+        let gx = ((n as u32) + bx - 1) / bx;
+        let gy = ((m as u32) + by - 1) / by;
+        (gx, gy, 1)
     }
 }
