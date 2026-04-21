@@ -155,7 +155,10 @@ pub use types::{
     TropicalMinPlus, TropicalScalar, TropicalSemiring, TropicalWithArgmax,
 };
 
-pub use crt::{bound_for_single_matmul, count_ground_states, CountedMat, CRT_PRIMES};
+pub use crt::{
+    bound_for_single_matmul, choose_primes, count_ground_states, crt_combine, CountedMat,
+    CRT_PRIMES,
+};
 
 // Convenient type aliases
 /// Alias for [`TropicalMaxPlus`].

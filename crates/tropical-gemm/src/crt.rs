@@ -25,7 +25,18 @@ pub const CRT_PRIMES: [i32; 16] = [
 ///
 /// Preconditions: `gcd(acc_modulus, prime) == 1` (true when `prime` is a
 /// fresh element from `CRT_PRIMES`), `0 <= residue < prime`.
-pub(crate) fn crt_combine(
+///
+/// # Example
+///
+/// ```
+/// use num_bigint::BigInt;
+/// use tropical_gemm::crt::crt_combine;
+/// // x ≡ 2 (mod 3), x ≡ 3 (mod 5) → x = 8 (mod 15)
+/// let (x, m) = crt_combine(&BigInt::from(2), &BigInt::from(3), 3, 5);
+/// assert_eq!(x, BigInt::from(8));
+/// assert_eq!(m, BigInt::from(15));
+/// ```
+pub fn crt_combine(
     acc_value: &BigInt,
     acc_modulus: &BigInt,
     residue: i32,
@@ -166,9 +177,22 @@ where
     CountedMat { nrows: m, ncols: n, values, counts }
 }
 
-/// Return the sequence of `CRT_PRIMES` indices to use, and their product,
-/// so that the product exceeds `needed_modulus`.
-fn choose_primes(needed_modulus: &BigInt) -> (Vec<usize>, BigInt) {
+/// Choose the smallest sequence of `CRT_PRIMES` indices whose product
+/// exceeds `needed_modulus`. Returns the index vector and the product.
+///
+/// Panics if the full table's product does not exceed `needed_modulus`.
+///
+/// # Example
+///
+/// ```
+/// use num_bigint::BigInt;
+/// use tropical_gemm::crt::choose_primes;
+/// let (indices, product) = choose_primes(&BigInt::from(5));
+/// // Smallest prime in CRT_PRIMES is ~2^30, so one suffices for bound 5.
+/// assert_eq!(indices, vec![0]);
+/// assert!(product > BigInt::from(5));
+/// ```
+pub fn choose_primes(needed_modulus: &BigInt) -> (Vec<usize>, BigInt) {
     let mut product = BigInt::one();
     let mut indices = Vec::new();
     for (i, &p) in CRT_PRIMES.iter().enumerate() {
