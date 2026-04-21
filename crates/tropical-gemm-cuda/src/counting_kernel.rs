@@ -1,8 +1,10 @@
 //! Launch wrapper for the CountingTropical CUDA kernels (spec C).
 //!
 //! Reuses `GpuMatrix<T>` for values and `GpuMatrix<i32>` for count residues.
-//! The kernel expects column-major data; the rest of the crate already uploads
-//! column-major, so no extra transposition is needed.
+//! The kernel expects **row-major** data (A is `m × k` row-major, B is
+//! `k × n` row-major, C is `m × n` row-major). `count_ground_states_gpu`
+//! uploads the host-supplied row-major slices unchanged, matching the CPU
+//! `tropical_matmul_t` / `count_ground_states` convention.
 
 use crate::context::CudaContext;
 use crate::error::Result;

@@ -83,3 +83,35 @@ fn gpu_f64_matches_cpu() {
     assert_eq!(gpu.values, cpu.values);
     assert_eq!(gpu.counts, cpu.counts);
 }
+
+/// Layout-contract test: asymmetric shapes with hand-chosen values where a
+/// row/col swap on either operand would flip the answer. Catches the
+/// classic row-major vs column-major bug.
+#[test]
+fn gpu_layout_contract_asymmetric() {
+    let ctx = CudaContext::new().unwrap();
+
+    // A is 2x3 (m=2, k=3), B is 3x2 (k=3, n=2). Row-major.
+    //   A = [[1, 2, 3],
+    //        [4, 5, 6]]
+    //   B = [[1, 2],
+    //        [3, 4],
+    //        [5, 6]]
+    // For Max: C[i,j] = max_k (A[i,k] + B[k,j]).
+    //   C[0,0] = max(1+1, 2+3, 3+5) = 8 (unique k=2, count=1)
+    //   C[0,1] = max(1+2, 2+4, 3+6) = 9 (unique k=2, count=1)
+    //   C[1,0] = max(4+1, 5+3, 6+5) = 11 (unique k=2, count=1)
+    //   C[1,1] = max(4+2, 5+4, 6+6) = 12 (unique k=2, count=1)
+    //
+    // If the kernel confused row-major with column-major on either operand,
+    // the answers would differ because the shapes are not symmetric.
+    let a: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+    let b: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+    let bound = bound_for_single_matmul(3);
+    let gpu = count_ground_states_gpu::<f32, Max>(&ctx, &a, 2, 3, &b, 2, &bound).unwrap();
+    assert_eq!(gpu.values, vec![8.0, 9.0, 11.0, 12.0]);
+    assert_eq!(
+        gpu.counts,
+        vec![BigInt::from(1), BigInt::from(1), BigInt::from(1), BigInt::from(1)]
+    );
+}
