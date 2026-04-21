@@ -241,6 +241,34 @@ impl_kernel_dispatch_portable!(
     TropicalMaxMul<i64>
 );
 
+// CountingTropical is a compound element: route all variants to the portable kernel.
+impl<T, C, D> KernelDispatch for crate::types::CountingTropical<T, C, D>
+where
+    T: crate::types::TropicalScalar,
+    C: crate::types::TropicalScalar,
+    D: crate::types::TropicalDirection,
+{
+    unsafe fn dispatch_gemm(
+        m: usize,
+        n: usize,
+        k: usize,
+        a: *const Self,
+        lda: usize,
+        trans_a: Transpose,
+        b: *const Self,
+        ldb: usize,
+        trans_b: Transpose,
+        c: *mut Self,
+        ldc: usize,
+    ) {
+        let kernel = PortableKernel;
+        let params = TilingParams::PORTABLE;
+        tropical_gemm_inner::<Self, _>(
+            m, n, k, a, lda, trans_a, b, ldb, trans_b, c, ldc, &params, &kernel,
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
