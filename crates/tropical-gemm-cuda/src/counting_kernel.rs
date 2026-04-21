@@ -1,4 +1,4 @@
-//! Launch wrapper for the CountingTropical CUDA kernels (spec C).
+//! Launch wrapper for the CountingTropical CUDA kernels (spec C, tiled in spec D).
 //!
 //! Reuses `GpuMatrix<T>` for values and `GpuMatrix<i32>` for count residues.
 //! The kernel expects **row-major** data (A is `m × k` row-major, B is
@@ -18,6 +18,9 @@ where
     D: TropicalDirection,
 {
     const KERNEL_NAME: &'static str;
+
+    /// Returns (grid_dim, block_dim) for a launch covering `m × n` output cells.
+    fn launch_dims(m: usize, n: usize) -> ((u32, u32, u32), (u32, u32, u32));
 
     fn launch_counting_gemm(
         ctx: &CudaContext,
@@ -44,9 +47,10 @@ where
         assert_eq!(count_c.cols(), n);
 
         let kernel = ctx.get_kernel(Self::KERNEL_NAME)?;
+        let (grid_dim, block_dim) = Self::launch_dims(m, n);
         let cfg = LaunchConfig {
-            grid_dim: CudaContext::counting_grid_dims(m, n),
-            block_dim: CudaContext::counting_block_dims(),
+            grid_dim,
+            block_dim,
             shared_mem_bytes: 0,
         };
 
@@ -75,15 +79,27 @@ where
 
 impl CountingCudaKernel<f32, Max> for (f32, Max) {
     const KERNEL_NAME: &'static str = "counting_gemm_f32_max";
+    fn launch_dims(m: usize, n: usize) -> ((u32, u32, u32), (u32, u32, u32)) {
+        (CudaContext::counting_grid_dims_f32(m, n), CudaContext::counting_block_dims_f32())
+    }
 }
 impl CountingCudaKernel<f32, Min> for (f32, Min) {
     const KERNEL_NAME: &'static str = "counting_gemm_f32_min";
+    fn launch_dims(m: usize, n: usize) -> ((u32, u32, u32), (u32, u32, u32)) {
+        (CudaContext::counting_grid_dims_f32(m, n), CudaContext::counting_block_dims_f32())
+    }
 }
 impl CountingCudaKernel<f64, Max> for (f64, Max) {
     const KERNEL_NAME: &'static str = "counting_gemm_f64_max";
+    fn launch_dims(m: usize, n: usize) -> ((u32, u32, u32), (u32, u32, u32)) {
+        (CudaContext::counting_grid_dims_f64(m, n), CudaContext::counting_block_dims_f64())
+    }
 }
 impl CountingCudaKernel<f64, Min> for (f64, Min) {
     const KERNEL_NAME: &'static str = "counting_gemm_f64_min";
+    fn launch_dims(m: usize, n: usize) -> ((u32, u32, u32), (u32, u32, u32)) {
+        (CudaContext::counting_grid_dims_f64(m, n), CudaContext::counting_block_dims_f64())
+    }
 }
 
 pub fn launch_counting_gemm<T, D>(
