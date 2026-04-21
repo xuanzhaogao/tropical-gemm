@@ -152,6 +152,8 @@ pub use types::{
     TropicalMinPlus, TropicalScalar, TropicalSemiring, TropicalWithArgmax,
 };
 
+pub use crt::{bound_for_single_matmul, count_ground_states, CountedMat, CRT_PRIMES};
+
 // Convenient type aliases
 /// Alias for [`TropicalMaxPlus`].
 pub type MaxPlus<T> = TropicalMaxPlus<T>;
