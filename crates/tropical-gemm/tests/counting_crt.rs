@@ -87,17 +87,28 @@ fn crt_counts_above_u64() {
     assert_eq!(got.counts, vec![BigInt::from(100)]);
 }
 
-/// Sanity: an input with NaNs would break the `value` equality check
-/// across primes because NaN != NaN. The driver's output may vary,
-/// but the test confirms the code completes without panic or corruption.
+/// Documents NaN absorption: known limitation.
+///
+/// `tropical_add` uses `is_strictly_better(a, b) = a > b` (for Max). Both
+/// `NaN > x` and `x > NaN` are false in IEEE 754, so every NaN candidate
+/// falls into the tie branch. With the accumulator starting at the
+/// tropical zero `-inf`, NaN contributions merge counts onto `-inf`
+/// instead of displacing it — the NaN value silently disappears and the
+/// accumulator remains `-inf` until a real number arrives.
+///
+/// For Max direction, the visible effect is: NaN inputs are treated as
+/// if they were not there, but their counts leak into the `-inf` count
+/// (which is then discarded by the first non-NaN comparison). This is
+/// **not** a CRT-layer bug — it's an artifact of how the underlying
+/// tropical semiring handles NaN. This test pins the current behavior
+/// so that any future change is explicit rather than accidental.
 #[test]
-fn crt_panics_on_nan_input() {
-    let a = [f32::NAN];
-    let b = [1.0_f32];
-    let bound = bound_for_single_matmul(1);
-    let result = count_ground_states::<f32, Max>(&a, 1, 1, &b, 1, &bound);
-    // NaN * 1.0 = NaN. In tropical_add with zero (-inf):
-    // NaN > -inf? False. -inf > NaN? False. So it's a tie; value stays -inf, counts merge (1 + 0 = 1).
-    assert_eq!(result.values[0], f32::NEG_INFINITY, "expected tropical zero (-inf) from tie");
-    assert_eq!(result.counts[0], BigInt::from(1));
+fn crt_nan_absorbed_silently_in_max() {
+    let a = [f32::NAN, 2.0_f32];
+    let b = [1.0_f32, 0.0_f32]; // 1x2 * 2x1
+    let bound = bound_for_single_matmul(2);
+    let r = count_ground_states::<f32, Max>(&a, 1, 2, &b, 1, &bound);
+    // The NaN path is silently dropped; the surviving k=1 path gives 2.
+    assert_eq!(r.values, vec![2.0]);
+    assert_eq!(r.counts, vec![BigInt::from(1)]);
 }
