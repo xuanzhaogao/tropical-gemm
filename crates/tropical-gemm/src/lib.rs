@@ -131,6 +131,9 @@ pub mod mat;
 pub mod simd;
 pub mod types;
 
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
+
 mod api;
 mod backend;
 

@@ -13,6 +13,7 @@ readme = "../../README.md"
 [features]
 default = ["parallel"]
 parallel = ["rayon"]
+testing = []
 
 [dependencies]
 num-traits = { workspace = true }
