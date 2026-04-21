@@ -115,3 +115,57 @@ fn gpu_layout_contract_asymmetric() {
         vec![BigInt::from(1), BigInt::from(1), BigInt::from(1), BigInt::from(1)]
     );
 }
+
+/// Large shape. Exercises the tile loop across many block iterations.
+#[test]
+fn gpu_large_shape_f32() {
+    let ctx = CudaContext::new().unwrap();
+    let (m, k, n) = (512, 512, 512);
+    let a = random_ish_matrix(m, k, 0xdead);
+    let b = random_ish_matrix(k, n, 0xbeef);
+    let bound = bound_for_single_matmul(k);
+
+    let cpu = count_ground_states::<f32, Max>(&a, m, k, &b, n, &bound);
+    let gpu = count_ground_states_gpu::<f32, Max>(&ctx, &a, m, k, &b, n, &bound).unwrap();
+
+    assert_eq!(gpu.values, cpu.values);
+    assert_eq!(gpu.counts, cpu.counts);
+}
+
+/// Off-block-boundary shape. Every dim is prime / not a multiple of block
+/// size, stressing the predicated tile-load bounds checks for all edges.
+#[test]
+fn gpu_off_boundary_shape() {
+    let ctx = CudaContext::new().unwrap();
+    let (m, k, n) = (17, 19, 23);
+    let a = random_ish_matrix(m, k, 0x1111);
+    let b = random_ish_matrix(k, n, 0x2222);
+    let bound = bound_for_single_matmul(k);
+
+    let cpu = count_ground_states::<f32, Max>(&a, m, k, &b, n, &bound);
+    let gpu = count_ground_states_gpu::<f32, Max>(&ctx, &a, m, k, &b, n, &bound).unwrap();
+
+    assert_eq!(gpu.values, cpu.values);
+    assert_eq!(gpu.counts, cpu.counts);
+}
+
+/// f64 medium shape. Exercises the f64 tiled macro specifically.
+#[test]
+fn gpu_f64_medium_shape() {
+    let ctx = CudaContext::new().unwrap();
+    let (m, k, n) = (128, 128, 128);
+    let mut state = 0xcafef00du64;
+    let mut gen = || {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((state >> 33) as u32 % 5) as f64
+    };
+    let a: Vec<f64> = (0..m * k).map(|_| gen()).collect();
+    let b: Vec<f64> = (0..k * n).map(|_| gen()).collect();
+    let bound = bound_for_single_matmul(k);
+
+    let cpu = count_ground_states::<f64, Max>(&a, m, k, &b, n, &bound);
+    let gpu = count_ground_states_gpu::<f64, Max>(&ctx, &a, m, k, &b, n, &bound).unwrap();
+
+    assert_eq!(gpu.values, cpu.values);
+    assert_eq!(gpu.counts, cpu.counts);
+}
