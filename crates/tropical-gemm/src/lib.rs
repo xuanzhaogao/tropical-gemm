@@ -147,7 +147,7 @@ pub use core::{GemmWithArgmax, Layout, Transpose};
 pub use mat::{Mat, MatMut, MatRef, MatWithArgmax};
 pub use simd::{simd_level, KernelDispatch, SimdLevel};
 pub use types::{
-    CountingTropical, SimdTropical, TropicalAndOr, TropicalMaxMul, TropicalMaxPlus,
+    CountingTropical, Max, Min, SimdTropical, TropicalAndOr, TropicalMaxMul, TropicalMaxPlus,
     TropicalMinPlus, TropicalScalar, TropicalSemiring, TropicalWithArgmax,
 };
 
@@ -168,7 +168,7 @@ pub mod prelude {
         tropical_backward_b_batched, tropical_matmul, tropical_matmul_batched,
         tropical_matmul_batched_with_argmax, tropical_matmul_strided_batched,
         tropical_matmul_t, tropical_matmul_with_argmax, AndOr, Backend, CountingTropical, GemmWithArgmax, Mat, MatMut,
-        MatRef, MatWithArgmax, MaxMul, MaxPlus, MinPlus, Transpose, TropicalAndOr, TropicalGemm,
+        MatRef, MatWithArgmax, Max, MaxMul, MaxPlus, Min, MinPlus, Transpose, TropicalAndOr, TropicalGemm,
         TropicalMaxMul, TropicalMaxPlus, TropicalMinPlus, TropicalSemiring, TropicalWithArgmax,
     };
 }
