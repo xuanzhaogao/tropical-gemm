@@ -17,8 +17,8 @@ impl<T: TropicalSemiring> Microkernel<T> for PortableKernel {
         mr: usize,
         nr: usize,
         k: usize,
-        a: *const T::Scalar,
-        b: *const T::Scalar,
+        a: *const T,
+        b: *const T,
         c: *mut T,
         ldc: usize,
     ) {
@@ -35,8 +35,8 @@ impl<T: TropicalWithArgmax<Index = u32>> MicrokernelWithArgmax<T> for PortableKe
         nr: usize,
         k: usize,
         k_offset: usize,
-        a: *const T::Scalar,
-        b: *const T::Scalar,
+        a: *const T,
+        b: *const T,
         c: *mut T,
         argmax: *mut u32,
         ldc: usize,
@@ -58,8 +58,8 @@ mod tests {
         let nr = 2;
         let k = 2;
 
-        let a: [f64; 8] = [1.0, 2.0, 0.0, 0.0, 3.0, 4.0, 0.0, 0.0];
-        let b: [f64; 8] = [1.0, 2.0, 0.0, 0.0, 3.0, 4.0, 0.0, 0.0];
+        let a = [1.0_f64, 2.0, 0.0, 0.0, 3.0, 4.0, 0.0, 0.0].map(TropicalMaxPlus);
+        let b = [1.0_f64, 2.0, 0.0, 0.0, 3.0, 4.0, 0.0, 0.0].map(TropicalMaxPlus);
         let mut c = [TropicalMaxPlus::tropical_zero(); 4];
         let ldc = 2;
 
@@ -78,8 +78,8 @@ mod tests {
         let nr = 2;
         let k = 2;
 
-        let a: [f64; 8] = [1.0, 2.0, 0.0, 0.0, 10.0, 20.0, 0.0, 0.0];
-        let b: [f64; 8] = [1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0];
+        let a = [1.0_f64, 2.0, 0.0, 0.0, 10.0, 20.0, 0.0, 0.0].map(TropicalMaxPlus);
+        let b = [1.0_f64, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0].map(TropicalMaxPlus);
         let mut c = [TropicalMaxPlus::tropical_zero(); 4];
         let mut argmax = [0u32; 4];
         let ldc = 2;

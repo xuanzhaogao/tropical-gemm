@@ -135,6 +135,13 @@ impl<S: TropicalSemiring> Mat<S> {
         Self { data, nrows, ncols }
     }
 
+    /// Create a matrix from a vector of semiring elements (alias for `from_vec`).
+    ///
+    /// Preferred name for clarity; semantically identical to `from_vec`.
+    pub fn from_elements(data: Vec<S>, nrows: usize, ncols: usize) -> Self {
+        Self::from_vec(data, nrows, ncols)
+    }
+
     /// Number of rows.
     #[inline]
     pub fn nrows(&self) -> usize {
@@ -180,16 +187,9 @@ impl<S: TropicalSemiring> Mat<S> {
 
     /// Convert to an immutable matrix reference.
     ///
-    /// The returned reference views the scalar values.
-    pub fn as_ref(&self) -> MatRef<'_, S>
-    where
-        S::Scalar: Copy,
-    {
-        // Extract scalars from semiring values
-        // This requires that the data is laid out such that we can get scalars
-        // For now, we create a view that extracts values on-the-fly
-        // This is a limitation - ideally we'd have a separate scalar buffer
-        MatRef::from_mat(self)
+    /// The returned reference views the element data directly.
+    pub fn as_ref(&self) -> MatRef<'_, S> {
+        MatRef::from_elements(&self.data, self.nrows, self.ncols)
     }
 
     /// Get a mutable pointer to the data.
@@ -244,8 +244,7 @@ impl<S: TropicalSemiring> IndexMut<(usize, usize)> for Mat<S> {
 // Matrix multiplication methods directly on Mat
 impl<S> Mat<S>
 where
-    S: TropicalSemiring + KernelDispatch,
-    S::Scalar: Copy,
+    S: TropicalSemiring + KernelDispatch + Default,
 {
     /// Perform tropical matrix multiplication: C = A ⊗ B.
     ///
@@ -291,17 +290,17 @@ where
         // in the correct column-major layout.
         unsafe {
             tropical_gemm_dispatch::<S>(
-                n,                           // rows of C^T = cols of C
-                m,                           // cols of C^T = rows of C
+                n,                                     // rows of C^T = cols of C
+                m,                                     // cols of C^T = rows of C
                 k,
-                b_ref.as_slice().as_ptr(),   // B becomes first operand (B^T)
-                k,                           // lda = nrows of B in col-major
+                b_ref.as_element_slice().as_ptr(),     // B becomes first operand (B^T)
+                k,                                     // lda = nrows of B in col-major
                 Transpose::NoTrans,
-                a_ref.as_slice().as_ptr(),   // A becomes second operand (A^T)
-                m,                           // ldb = nrows of A in col-major
+                a_ref.as_element_slice().as_ptr(),     // A becomes second operand (A^T)
+                m,                                     // ldb = nrows of A in col-major
                 Transpose::NoTrans,
                 c.data.as_mut_ptr(),
-                m,                           // ldc = nrows of C in col-major
+                m,                                     // ldc = nrows of C in col-major
             );
         }
 
@@ -336,10 +335,10 @@ where
                 n,
                 m,
                 k,
-                b.as_slice().as_ptr(),
+                b.as_element_slice().as_ptr(),
                 k,
                 Transpose::NoTrans,
-                a_ref.as_slice().as_ptr(),
+                a_ref.as_element_slice().as_ptr(),
                 m,
                 Transpose::NoTrans,
                 c.data.as_mut_ptr(),
@@ -354,8 +353,7 @@ where
 // Argmax methods on Mat
 impl<S> Mat<S>
 where
-    S: TropicalWithArgmax<Index = u32> + KernelDispatch,
-    S::Scalar: Copy,
+    S: TropicalWithArgmax<Index = u32> + KernelDispatch + Default,
 {
     /// Perform tropical matrix multiplication with argmax tracking.
     ///
@@ -400,10 +398,10 @@ where
                 n,
                 m,
                 k,
-                b_ref.as_slice().as_ptr(),
+                b_ref.as_element_slice().as_ptr(),
                 k,
                 Transpose::NoTrans,
-                a_ref.as_slice().as_ptr(),
+                a_ref.as_element_slice().as_ptr(),
                 m,
                 Transpose::NoTrans,
                 &mut result,
@@ -504,8 +502,7 @@ where
 // Batched operations on Mat
 impl<S> Mat<S>
 where
-    S: TropicalSemiring + KernelDispatch,
-    S::Scalar: Copy,
+    S: TropicalSemiring + KernelDispatch + Default,
 {
     /// Batched tropical matrix multiplication.
     ///

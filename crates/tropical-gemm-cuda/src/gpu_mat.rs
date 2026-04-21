@@ -31,6 +31,7 @@ use std::marker::PhantomData;
 
 use cudarc::driver::{DeviceRepr, ValidAsZeroBits};
 use tropical_gemm::mat::{Mat, MatRef, MatWithArgmax};
+use tropical_gemm::types::ReprTransparentTropical;
 use tropical_gemm::TropicalSemiring;
 
 use crate::context::CudaContext;
@@ -59,7 +60,10 @@ where
     /// Create a GPU matrix from a CPU MatRef.
     ///
     /// The MatRef data is expected to be in column-major order.
-    pub fn from_matref(ctx: &CudaContext, mat: &MatRef<S>) -> Result<Self> {
+    pub fn from_matref(ctx: &CudaContext, mat: &MatRef<S>) -> Result<Self>
+    where
+        S: ReprTransparentTropical,
+    {
         let inner = GpuMatrix::from_host(ctx, mat.as_slice(), mat.nrows(), mat.ncols())?;
         Ok(Self {
             inner,
@@ -262,7 +266,7 @@ where
     /// ```
     pub fn from_mats(ctx: &CudaContext, mats: &[Mat<S>]) -> Result<Vec<GpuMat<S>>>
     where
-        S::Scalar: Copy,
+        S: ReprTransparentTropical,
     {
         mats.iter()
             .map(|m| {

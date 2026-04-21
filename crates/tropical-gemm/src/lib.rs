@@ -138,7 +138,7 @@ pub use api::{
     tropical_backward_a, tropical_backward_a_batched, tropical_backward_b,
     tropical_backward_b_batched, tropical_gemm, tropical_matmul, tropical_matmul_batched,
     tropical_matmul_batched_with_argmax, tropical_matmul_strided_batched,
-    tropical_matmul_with_argmax, TropicalGemm,
+    tropical_matmul_t, tropical_matmul_with_argmax, TropicalGemm,
 };
 pub use backend::{version_info, Backend};
 
@@ -167,7 +167,7 @@ pub mod prelude {
         tropical_backward_a, tropical_backward_a_batched, tropical_backward_b,
         tropical_backward_b_batched, tropical_matmul, tropical_matmul_batched,
         tropical_matmul_batched_with_argmax, tropical_matmul_strided_batched,
-        tropical_matmul_with_argmax, AndOr, Backend, CountingTropical, GemmWithArgmax, Mat, MatMut,
+        tropical_matmul_t, tropical_matmul_with_argmax, AndOr, Backend, CountingTropical, GemmWithArgmax, Mat, MatMut,
         MatRef, MatWithArgmax, MaxMul, MaxPlus, MinPlus, Transpose, TropicalAndOr, TropicalGemm,
         TropicalMaxMul, TropicalMaxPlus, TropicalMinPlus, TropicalSemiring, TropicalWithArgmax,
     };
