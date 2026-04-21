@@ -126,6 +126,7 @@
 
 // Internal modules
 pub mod core;
+pub mod crt;
 pub mod mat;
 pub mod simd;
 pub mod types;
