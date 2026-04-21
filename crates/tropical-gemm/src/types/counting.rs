@@ -141,9 +141,10 @@ impl<T: TropicalScalar, C: TropicalScalar, D: TropicalDirection> TropicalWithArg
 impl<T: TropicalScalar, C: TropicalScalar, D: TropicalDirection> SimdTropical
     for CountingTropical<T, C, D>
 {
-    // SIMD for CountingTropical requires SOA layout
-    const SIMD_AVAILABLE: bool = true;
-    const SIMD_WIDTH: usize = 8;
+    // No SIMD kernel exists for CountingTropical yet; claim will be revisited
+    // when an SoA-based vectorized path is added.
+    const SIMD_AVAILABLE: bool = false;
+    const SIMD_WIDTH: usize = 1;
 }
 
 impl<T: TropicalScalar, C: TropicalScalar, D: TropicalDirection> Add
@@ -397,8 +398,8 @@ mod tests {
 
     #[test]
     fn test_simd_tropical() {
-        assert!(CountingTropical::<f64>::SIMD_AVAILABLE);
-        assert_eq!(CountingTropical::<f64>::SIMD_WIDTH, 8);
+        assert!(!CountingTropical::<f64>::SIMD_AVAILABLE);
+        assert_eq!(CountingTropical::<f64>::SIMD_WIDTH, 1);
     }
 
     #[test]
