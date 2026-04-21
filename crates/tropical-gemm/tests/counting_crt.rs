@@ -72,3 +72,17 @@ fn crt_count_fits_one_prime_still_uses_one_prime() {
     let got = count_ground_states::<f32, Max>(&a, 1, 1, &b, 1, &bound);
     assert_eq!(got.counts, vec![BigInt::from(1)]);
 }
+
+/// Force the driver to use multiple primes by supplying a bound > u128::MAX.
+/// The true count is small (100), so the multi-prime CRT path must still
+/// reconstruct it exactly.
+#[test]
+fn crt_counts_above_u64() {
+    let a = vec![0.0_f32; 100];
+    let b = vec![0.0_f32; 100];
+    let pretend_huge_bound = BigInt::from(u128::MAX);
+    let got = count_ground_states::<f32, Max>(&a, 1, 100, &b, 1, &pretend_huge_bound);
+    // True count = 100. The bound only affects how many primes we use;
+    // correctness is invariant.
+    assert_eq!(got.counts, vec![BigInt::from(100)]);
+}
