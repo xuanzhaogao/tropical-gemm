@@ -71,6 +71,7 @@ mod direction;
 mod max_mul;
 mod max_plus;
 mod min_plus;
+mod modp;
 mod scalar;
 mod traits;
 
@@ -80,5 +81,6 @@ pub use direction::{Max, Min, TropicalDirection};
 pub use max_mul::TropicalMaxMul;
 pub use max_plus::TropicalMaxPlus;
 pub use min_plus::TropicalMinPlus;
+pub use modp::Mod;
 pub use scalar::TropicalScalar;
 pub use traits::{ReprTransparentTropical, SimdTropical, TropicalSemiring, TropicalWithArgmax};
