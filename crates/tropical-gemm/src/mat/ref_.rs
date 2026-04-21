@@ -15,9 +15,9 @@ use super::{Mat, MatWithArgmax};
 /// specified semiring type.
 ///
 /// ```
-/// use tropical_gemm::{MatRef, MaxPlus};
+/// use tropical_gemm::{MatRef, MaxPlus, TropicalMaxPlus};
 ///
-/// let data = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0].map(MaxPlus);
+/// let data = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0].map(TropicalMaxPlus);
 /// let a = MatRef::<MaxPlus<f32>>::from_elements(&data, 2, 3);
 ///
 /// assert_eq!(a.nrows(), 2);
