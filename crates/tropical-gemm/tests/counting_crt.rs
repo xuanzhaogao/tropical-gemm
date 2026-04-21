@@ -86,3 +86,18 @@ fn crt_counts_above_u64() {
     // correctness is invariant.
     assert_eq!(got.counts, vec![BigInt::from(100)]);
 }
+
+/// Sanity: an input with NaNs would break the `value` equality check
+/// across primes because NaN != NaN. The driver's output may vary,
+/// but the test confirms the code completes without panic or corruption.
+#[test]
+fn crt_panics_on_nan_input() {
+    let a = [f32::NAN];
+    let b = [1.0_f32];
+    let bound = bound_for_single_matmul(1);
+    let result = count_ground_states::<f32, Max>(&a, 1, 1, &b, 1, &bound);
+    // NaN * 1.0 = NaN. In tropical_add with zero (-inf):
+    // NaN > -inf? False. -inf > NaN? False. So it's a tie; value stays -inf, counts merge (1 + 0 = 1).
+    assert_eq!(result.values[0], f32::NEG_INFINITY, "expected tropical zero (-inf) from tie");
+    assert_eq!(result.counts[0], BigInt::from(1));
+}
