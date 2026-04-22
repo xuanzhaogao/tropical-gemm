@@ -168,32 +168,24 @@ impl CudaContext {
         (bszm, bszn, 1)
     }
 
-    /// f32 counting kernel block dims (32 × 32 = 1024 threads).
-    /// THREAD_SIZE_M × N = 2 × 2, so blockDim = BLOCK_SIZE_M/2 × BLOCK_SIZE_N/2.
+    /// Counting kernel block dims (naive: one thread per output cell).
     pub fn counting_block_dims_f32() -> (u32, u32, u32) {
-        (32, 32, 1)
+        (16, 16, 1)
     }
 
-    /// f32 counting kernel grid dims. Matches BLOCK_SIZE_M = BLOCK_SIZE_N = 64.
+    /// Grid dims: one block covers a 16×16 output tile.
     pub fn counting_grid_dims_f32(m: usize, n: usize) -> (u32, u32, u32) {
-        const BLOCK_M: u32 = 64;
-        const BLOCK_N: u32 = 64;
-        let gx = ((n as u32) + BLOCK_N - 1) / BLOCK_N;
-        let gy = ((m as u32) + BLOCK_M - 1) / BLOCK_M;
+        let (bx, by, _) = Self::counting_block_dims_f32();
+        let gx = ((n as u32) + bx - 1) / bx;
+        let gy = ((m as u32) + by - 1) / by;
         (gx, gy, 1)
     }
 
-    /// f64 counting kernel block dims (8 × 8 = 64 threads).
     pub fn counting_block_dims_f64() -> (u32, u32, u32) {
-        (8, 8, 1)
+        (16, 16, 1)
     }
 
-    /// f64 counting kernel grid dims. Matches BLOCK_SIZE_M = BLOCK_SIZE_N = 32.
     pub fn counting_grid_dims_f64(m: usize, n: usize) -> (u32, u32, u32) {
-        const BLOCK_M: u32 = 32;
-        const BLOCK_N: u32 = 32;
-        let gx = ((n as u32) + BLOCK_N - 1) / BLOCK_N;
-        let gy = ((m as u32) + BLOCK_M - 1) / BLOCK_M;
-        (gx, gy, 1)
+        Self::counting_grid_dims_f32(m, n)
     }
 }
