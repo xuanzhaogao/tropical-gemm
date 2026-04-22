@@ -168,9 +168,10 @@ impl CudaContext {
         (bszm, bszn, 1)
     }
 
-    /// f32 counting kernel block dims (16 × 16 = 256 threads).
+    /// f32 counting kernel block dims (32 × 32 = 1024 threads).
+    /// THREAD_SIZE_M × N = 2 × 2, so blockDim = BLOCK_SIZE_M/2 × BLOCK_SIZE_N/2.
     pub fn counting_block_dims_f32() -> (u32, u32, u32) {
-        (16, 16, 1)
+        (32, 32, 1)
     }
 
     /// f32 counting kernel grid dims. Matches BLOCK_SIZE_M = BLOCK_SIZE_N = 64.

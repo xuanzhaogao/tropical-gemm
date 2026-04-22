@@ -51,7 +51,7 @@ __device__ __forceinline__ unsigned long long barrett_mod(
 // Block sizes: 64x32x64, Thread sizes: 4x4. Threads per block: 256 (16x16).
 
 #define COUNTING_GEMM_F32(NAME, INIT_VAL, BETTER)                              \
-extern "C" __global__ void NAME(                                               \
+extern "C" __global__ __launch_bounds__(1024, 1) void NAME(                    \
     const float* __restrict__ value_a, const int* __restrict__ count_a,        \
     const float* __restrict__ value_b, const int* __restrict__ count_b,        \
     float* __restrict__ value_c, int* __restrict__ count_c,                    \
@@ -60,8 +60,8 @@ extern "C" __global__ void NAME(                                               \
     const int BLOCK_SIZE_M = 64;                                               \
     const int BLOCK_SIZE_K = 32;                                               \
     const int BLOCK_SIZE_N = 64;                                               \
-    const int THREAD_SIZE_M = 4;                                               \
-    const int THREAD_SIZE_N = 4;                                               \
+    const int THREAD_SIZE_M = 2;                                               \
+    const int THREAD_SIZE_N = 2;                                               \
                                                                                \
     const int bszm = BLOCK_SIZE_M / THREAD_SIZE_M;                             \
     const int bszn = BLOCK_SIZE_N / THREAD_SIZE_N;                             \
