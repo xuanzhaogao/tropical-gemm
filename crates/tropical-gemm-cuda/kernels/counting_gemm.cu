@@ -1,4 +1,4 @@
-// Counting Tropical GEMM CUDA Kernels (spec D tiled version).
+// Counting Tropical GEMM CUDA Kernels (spec D tiled + spec E Barrett optimization).
 //
 // SoA element layout: each logical element = (value: T, count: int32).
 // Matrices are passed as parallel value and count pointers, row-major.
@@ -10,6 +10,16 @@
 // Semiring operations (direction D):
 //   tropical_mul: (va, ca) * (vb, cb) = (va + vb, (ca * cb) mod P)
 //   tropical_add: strictly-better value wins; on tie, counts add mod P.
+//
+// Optimization: the per-step `% P` is software-emulated division on most
+// GPUs (~50 cycles). We replace it with Barrett reduction using a host-
+// precomputed reciprocal `mu = floor(2^64 / P)`. For x < 2^60 and P < 2^30:
+//     q = __umul64hi(x, mu)             // ~4-8 cycles
+//     r = x - q * P                     // in [0, 2P)
+//     if (r >= P) r -= P                // correction
+// Also defers the tie-branch modular reduction: count accumulator stays
+// in u64, un-reduced, until write-back. For K <= 2^31 iterations, the
+// accumulator is bounded by K * P < 2^61 — safe in u64.
 
 // Infinity sentinels for MaxPlus / MinPlus tropical zero.
 #define NEG_INF_F32 __int_as_float(0xff800000)
@@ -23,6 +33,18 @@
 #define MAX_BETTER(a, b) ((a) > (b))
 #define MIN_BETTER(a, b) ((a) < (b))
 
+// Barrett reduction. Returns x mod P given x in [0, 2^60) and P in (0, 2^30).
+// `mu = floor(2^64 / P)` is precomputed on the host and passed as a kernel arg.
+// Result is in [0, P).
+__device__ __forceinline__ unsigned long long barrett_mod(
+    unsigned long long x, unsigned long long P, unsigned long long mu)
+{
+    unsigned long long q = __umul64hi(x, mu);
+    unsigned long long r = x - q * P;
+    if (r >= P) r -= P;
+    return r;
+}
+
 // ============================================================================
 // F32 COUNTING KERNEL MACRO
 // ============================================================================
@@ -33,7 +55,7 @@ extern "C" __global__ void NAME(                                               \
     const float* __restrict__ value_a, const int* __restrict__ count_a,        \
     const float* __restrict__ value_b, const int* __restrict__ count_b,        \
     float* __restrict__ value_c, int* __restrict__ count_c,                    \
-    int M, int N, int K, int P                                                 \
+    int M, int N, int K, int P, unsigned long long MU                          \
 ) {                                                                            \
     const int BLOCK_SIZE_M = 64;                                               \
     const int BLOCK_SIZE_K = 32;                                               \
@@ -55,12 +77,12 @@ extern "C" __global__ void NAME(                                               \
     __shared__ float Bs_val[BLOCK_SIZE_K * BLOCK_SIZE_N];                      \
     __shared__ int   Bs_cnt[BLOCK_SIZE_K * BLOCK_SIZE_N];                      \
                                                                                \
-    float val_accum[THREAD_SIZE_M * THREAD_SIZE_N];                            \
-    int   cnt_accum[THREAD_SIZE_M * THREAD_SIZE_N];                            \
+    float              val_accum[THREAD_SIZE_M * THREAD_SIZE_N];               \
+    unsigned long long cnt_accum[THREAD_SIZE_M * THREAD_SIZE_N];               \
     float regs_a_val[THREAD_SIZE_M];                                           \
-    int   regs_a_cnt[THREAD_SIZE_M];                                           \
+    unsigned int regs_a_cnt[THREAD_SIZE_M];                                    \
     float regs_b_val[THREAD_SIZE_N];                                           \
-    int   regs_b_cnt[THREAD_SIZE_N];                                           \
+    unsigned int regs_b_cnt[THREAD_SIZE_N];                                    \
                                                                                \
     _Pragma("unroll")                                                          \
     for (int i = 0; i < THREAD_SIZE_M * THREAD_SIZE_N; ++i) {                  \
@@ -74,6 +96,8 @@ extern "C" __global__ void NAME(                                               \
     const int B_TILE_COL = tid % BLOCK_SIZE_N;                                 \
     const int A_TILE_ROW_STRIDE = THREAD_NUM_PER_BLOCK / BLOCK_SIZE_K;         \
     const int B_TILE_ROW_STRIDE = THREAD_NUM_PER_BLOCK / BLOCK_SIZE_N;         \
+                                                                               \
+    const unsigned long long Pull = (unsigned long long)P;                     \
                                                                                \
     for (int tile_idx = 0; tile_idx < K; tile_idx += BLOCK_SIZE_K) {           \
         _Pragma("unroll")                                                      \
@@ -113,33 +137,31 @@ extern "C" __global__ void NAME(                                               \
             for (int tm = 0; tm < THREAD_SIZE_M; ++tm) {                       \
                 int r = threadIdx.y * THREAD_SIZE_M + tm;                      \
                 regs_a_val[tm] = As_val[OFFSET_ROW(r, k, BLOCK_SIZE_K)];       \
-                regs_a_cnt[tm] = As_cnt[OFFSET_ROW(r, k, BLOCK_SIZE_K)];       \
+                regs_a_cnt[tm] = (unsigned int)As_cnt[OFFSET_ROW(r, k, BLOCK_SIZE_K)]; \
             }                                                                  \
             _Pragma("unroll")                                                  \
             for (int tn = 0; tn < THREAD_SIZE_N; ++tn) {                       \
                 int c = threadIdx.x * THREAD_SIZE_N + tn;                      \
                 regs_b_val[tn] = Bs_val[OFFSET_ROW(k, c, BLOCK_SIZE_N)];       \
-                regs_b_cnt[tn] = Bs_cnt[OFFSET_ROW(k, c, BLOCK_SIZE_N)];       \
+                regs_b_cnt[tn] = (unsigned int)Bs_cnt[OFFSET_ROW(k, c, BLOCK_SIZE_N)]; \
             }                                                                  \
             _Pragma("unroll")                                                  \
             for (int tm = 0; tm < THREAD_SIZE_M; ++tm) {                       \
                 _Pragma("unroll")                                              \
                 for (int tn = 0; tn < THREAD_SIZE_N; ++tn) {                   \
                     int idx = tm * THREAD_SIZE_N + tn;                         \
-                    float pv = regs_a_val[tm] + regs_b_val[tn];                \
-                    int   pc = (int)(((long long)regs_a_cnt[tm]                \
-                                     * (long long)regs_b_cnt[tn])              \
-                                     % (long long)P);                          \
-                    if (BETTER(pv, val_accum[idx])) {                          \
-                        val_accum[idx] = pv;                                   \
-                        cnt_accum[idx] = pc;                                   \
-                    } else if (BETTER(val_accum[idx], pv)) {                   \
-                        /* keep */                                             \
-                    } else {                                                   \
-                        cnt_accum[idx] = (int)(((long long)cnt_accum[idx]      \
-                                                + (long long)pc)               \
-                                                % (long long)P);               \
-                    }                                                          \
+                    float              pv = regs_a_val[tm] + regs_b_val[tn];   \
+                    unsigned long long prod =                                  \
+                        (unsigned long long)regs_a_cnt[tm]                     \
+                        * (unsigned long long)regs_b_cnt[tn];                  \
+                    unsigned long long pc = barrett_mod(prod, Pull, MU);       \
+                    /* Branchless tropical_add: reduces warp divergence. */   \
+                    bool win = BETTER(pv, val_accum[idx]);                     \
+                    bool tie = (pv == val_accum[idx]);                         \
+                    val_accum[idx] = win ? pv : val_accum[idx];                \
+                    unsigned long long added = cnt_accum[idx] + pc;            \
+                    cnt_accum[idx] = win ? pc                                  \
+                                   : (tie ? added : cnt_accum[idx]);           \
                 }                                                              \
             }                                                                  \
         }                                                                      \
@@ -155,7 +177,9 @@ extern "C" __global__ void NAME(                                               \
             if (row < M && col < N) {                                          \
                 int idx = tm * THREAD_SIZE_N + tn;                             \
                 value_c[OFFSET_ROW(row, col, N)] = val_accum[idx];             \
-                count_c[OFFSET_ROW(row, col, N)] = cnt_accum[idx];             \
+                /* Final reduction: acc < K * P < 2^61, safe to Barrett. */    \
+                unsigned long long red = barrett_mod(cnt_accum[idx], Pull, MU);\
+                count_c[OFFSET_ROW(row, col, N)] = (int)red;                   \
             }                                                                  \
         }                                                                      \
     }                                                                          \
@@ -171,7 +195,7 @@ extern "C" __global__ void NAME(                                               \
     const double* __restrict__ value_a, const int* __restrict__ count_a,       \
     const double* __restrict__ value_b, const int* __restrict__ count_b,       \
     double* __restrict__ value_c, int* __restrict__ count_c,                   \
-    int M, int N, int K, int P                                                 \
+    int M, int N, int K, int P, unsigned long long MU                          \
 ) {                                                                            \
     const int BLOCK_SIZE_M = 32;                                               \
     const int BLOCK_SIZE_K = 16;                                               \
@@ -193,12 +217,12 @@ extern "C" __global__ void NAME(                                               \
     __shared__ double Bs_val[BLOCK_SIZE_K * BLOCK_SIZE_N];                     \
     __shared__ int    Bs_cnt[BLOCK_SIZE_K * BLOCK_SIZE_N];                     \
                                                                                \
-    double val_accum[THREAD_SIZE_M * THREAD_SIZE_N];                           \
-    int    cnt_accum[THREAD_SIZE_M * THREAD_SIZE_N];                           \
+    double             val_accum[THREAD_SIZE_M * THREAD_SIZE_N];               \
+    unsigned long long cnt_accum[THREAD_SIZE_M * THREAD_SIZE_N];               \
     double regs_a_val[THREAD_SIZE_M];                                          \
-    int    regs_a_cnt[THREAD_SIZE_M];                                          \
+    unsigned int regs_a_cnt[THREAD_SIZE_M];                                    \
     double regs_b_val[THREAD_SIZE_N];                                          \
-    int    regs_b_cnt[THREAD_SIZE_N];                                          \
+    unsigned int regs_b_cnt[THREAD_SIZE_N];                                    \
                                                                                \
     _Pragma("unroll")                                                          \
     for (int i = 0; i < THREAD_SIZE_M * THREAD_SIZE_N; ++i) {                  \
@@ -212,6 +236,8 @@ extern "C" __global__ void NAME(                                               \
     const int B_TILE_COL = tid % BLOCK_SIZE_N;                                 \
     const int A_TILE_ROW_STRIDE = THREAD_NUM_PER_BLOCK / BLOCK_SIZE_K;         \
     const int B_TILE_ROW_STRIDE = THREAD_NUM_PER_BLOCK / BLOCK_SIZE_N;         \
+                                                                               \
+    const unsigned long long Pull = (unsigned long long)P;                     \
                                                                                \
     for (int tile_idx = 0; tile_idx < K; tile_idx += BLOCK_SIZE_K) {           \
         _Pragma("unroll")                                                      \
@@ -251,33 +277,31 @@ extern "C" __global__ void NAME(                                               \
             for (int tm = 0; tm < THREAD_SIZE_M; ++tm) {                       \
                 int r = threadIdx.y * THREAD_SIZE_M + tm;                      \
                 regs_a_val[tm] = As_val[OFFSET_ROW(r, k, BLOCK_SIZE_K)];       \
-                regs_a_cnt[tm] = As_cnt[OFFSET_ROW(r, k, BLOCK_SIZE_K)];       \
+                regs_a_cnt[tm] = (unsigned int)As_cnt[OFFSET_ROW(r, k, BLOCK_SIZE_K)]; \
             }                                                                  \
             _Pragma("unroll")                                                  \
             for (int tn = 0; tn < THREAD_SIZE_N; ++tn) {                       \
                 int c = threadIdx.x * THREAD_SIZE_N + tn;                      \
                 regs_b_val[tn] = Bs_val[OFFSET_ROW(k, c, BLOCK_SIZE_N)];       \
-                regs_b_cnt[tn] = Bs_cnt[OFFSET_ROW(k, c, BLOCK_SIZE_N)];       \
+                regs_b_cnt[tn] = (unsigned int)Bs_cnt[OFFSET_ROW(k, c, BLOCK_SIZE_N)]; \
             }                                                                  \
             _Pragma("unroll")                                                  \
             for (int tm = 0; tm < THREAD_SIZE_M; ++tm) {                       \
                 _Pragma("unroll")                                              \
                 for (int tn = 0; tn < THREAD_SIZE_N; ++tn) {                   \
                     int idx = tm * THREAD_SIZE_N + tn;                         \
-                    double pv = regs_a_val[tm] + regs_b_val[tn];               \
-                    int    pc = (int)(((long long)regs_a_cnt[tm]               \
-                                      * (long long)regs_b_cnt[tn])             \
-                                      % (long long)P);                         \
-                    if (BETTER(pv, val_accum[idx])) {                          \
-                        val_accum[idx] = pv;                                   \
-                        cnt_accum[idx] = pc;                                   \
-                    } else if (BETTER(val_accum[idx], pv)) {                   \
-                        /* keep */                                             \
-                    } else {                                                   \
-                        cnt_accum[idx] = (int)(((long long)cnt_accum[idx]      \
-                                                + (long long)pc)               \
-                                                % (long long)P);               \
-                    }                                                          \
+                    double             pv = regs_a_val[tm] + regs_b_val[tn];   \
+                    unsigned long long prod =                                  \
+                        (unsigned long long)regs_a_cnt[tm]                     \
+                        * (unsigned long long)regs_b_cnt[tn];                  \
+                    unsigned long long pc = barrett_mod(prod, Pull, MU);       \
+                    /* Branchless tropical_add: reduces warp divergence. */   \
+                    bool win = BETTER(pv, val_accum[idx]);                     \
+                    bool tie = (pv == val_accum[idx]);                         \
+                    val_accum[idx] = win ? pv : val_accum[idx];                \
+                    unsigned long long added = cnt_accum[idx] + pc;            \
+                    cnt_accum[idx] = win ? pc                                  \
+                                   : (tie ? added : cnt_accum[idx]);           \
                 }                                                              \
             }                                                                  \
         }                                                                      \
@@ -293,7 +317,8 @@ extern "C" __global__ void NAME(                                               \
             if (row < M && col < N) {                                          \
                 int idx = tm * THREAD_SIZE_N + tn;                             \
                 value_c[OFFSET_ROW(row, col, N)] = val_accum[idx];             \
-                count_c[OFFSET_ROW(row, col, N)] = cnt_accum[idx];             \
+                unsigned long long red = barrett_mod(cnt_accum[idx], Pull, MU);\
+                count_c[OFFSET_ROW(row, col, N)] = (int)red;                   \
             }                                                                  \
         }                                                                      \
     }                                                                          \

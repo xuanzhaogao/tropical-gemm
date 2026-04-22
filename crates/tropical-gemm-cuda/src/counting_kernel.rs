@@ -54,6 +54,17 @@ where
             shared_mem_bytes: 0,
         };
 
+        // Barrett reciprocal mu = floor(2^64 / P). Host-precomputed so the
+        // kernel can replace `% P` with mul-hi + sub + cond-sub.
+        // For P >= 1, u128 math is exact. For the special case P == 1 (should
+        // not occur with CRT_PRIMES but guard anyway), mu = 0 gives correct
+        // r = x which is then reduced by the `if (r >= P) r -= P` correction.
+        let mu: u64 = if modulus > 1 {
+            ((1u128 << 64) / modulus as u128) as u64
+        } else {
+            0
+        };
+
         unsafe {
             kernel.launch(
                 cfg,
@@ -68,6 +79,7 @@ where
                     n as i32,
                     k as i32,
                     modulus,
+                    mu,
                 ),
             )?;
         }

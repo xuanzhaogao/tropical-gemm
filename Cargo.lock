@@ -879,6 +879,9 @@ version = "0.2.0"
 dependencies = [
  "criterion",
  "cudarc",
+ "num-bigint",
+ "num-integer",
+ "num-traits",
  "once_cell",
  "thiserror",
  "tropical-gemm",
@@ -889,6 +892,7 @@ name = "tropical-gemm-python"
 version = "0.2.0"
 dependencies = [
  "dlpark",
+ "num-bigint",
  "numpy",
  "pyo3",
  "tropical-gemm",
