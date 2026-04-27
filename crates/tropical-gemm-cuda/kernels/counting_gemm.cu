@@ -150,3 +150,114 @@ COUNTING_GEMM_WARPK(counting_gemm_f32_max_warpk, float,  NEG_INF_F32, MAX_BETTER
 COUNTING_GEMM_WARPK(counting_gemm_f32_min_warpk, float,  POS_INF_F32, MIN_BETTER)
 COUNTING_GEMM_WARPK(counting_gemm_f64_max_warpk, double, NEG_INF_F64, MAX_BETTER)
 COUNTING_GEMM_WARPK(counting_gemm_f64_min_warpk, double, POS_INF_F64, MIN_BETTER)
+
+// ============================================================================
+// Spec F — AoS (value, count) element layout.
+//
+// Each input element is a packed (val, cnt) struct:
+//   PairF32: 8 B aligned (one LDG.E.64 per element)
+//   PairF64: 16 B aligned (one LDG.E.128 per element; 4 B pad)
+// Output buffers stay SoA — callers consume value and count separately.
+//
+// Halves the LDG instruction count in the inner loop (was 2 LDG.E.32 per
+// matrix element, now 1 LDG.E.64 / .128).
+// ============================================================================
+
+struct __align__(8)  PairF32 { float  val; int cnt; };
+struct __align__(16) PairF64 { double val; int cnt; int _pad; };
+
+#define COUNTING_GEMM_AOS(NAME, T, PAIR, INIT_VAL, BETTER)                     \
+extern "C" __global__ void NAME(                                               \
+    const PAIR* __restrict__ pair_a,                                           \
+    const PAIR* __restrict__ pair_b,                                           \
+    T*    __restrict__ value_c, int* __restrict__ count_c,                     \
+    int M, int N, int K, int P, unsigned long long MU                          \
+) {                                                                            \
+    int i = blockIdx.y * blockDim.y + threadIdx.y;                             \
+    int j = blockIdx.x * blockDim.x + threadIdx.x;                             \
+    if (i >= M || j >= N) return;                                              \
+                                                                               \
+    T                  acc_val = (INIT_VAL);                                   \
+    unsigned long long acc_cnt = 0;                                            \
+    const unsigned long long Pull = (unsigned long long)P;                     \
+                                                                               \
+    for (int k = 0; k < K; ++k) {                                              \
+        PAIR a = pair_a[OFFSET_ROW(i, k, K)];                                  \
+        PAIR b = pair_b[OFFSET_ROW(k, j, N)];                                  \
+        T            pv = a.val + b.val;                                       \
+        unsigned int ca = (unsigned int)a.cnt;                                 \
+        unsigned int cb = (unsigned int)b.cnt;                                 \
+        unsigned long long prod = (unsigned long long)ca * (unsigned long long)cb; \
+        unsigned long long pc = barrett_mod(prod, Pull, MU);                   \
+        bool win = BETTER(pv, acc_val);                                        \
+        bool tie = (pv == acc_val);                                            \
+        acc_val = win ? pv : acc_val;                                          \
+        acc_cnt = win ? pc : (tie ? (acc_cnt + pc) : acc_cnt);                 \
+    }                                                                          \
+    value_c[OFFSET_ROW(i, j, N)] = acc_val;                                    \
+    count_c[OFFSET_ROW(i, j, N)] = (int)barrett_mod(acc_cnt, Pull, MU);        \
+}
+
+COUNTING_GEMM_AOS(counting_gemm_f32_max_aos, float,  PairF32, NEG_INF_F32, MAX_BETTER)
+COUNTING_GEMM_AOS(counting_gemm_f32_min_aos, float,  PairF32, POS_INF_F32, MIN_BETTER)
+COUNTING_GEMM_AOS(counting_gemm_f64_max_aos, double, PairF64, NEG_INF_F64, MAX_BETTER)
+COUNTING_GEMM_AOS(counting_gemm_f64_min_aos, double, PairF64, POS_INF_F64, MIN_BETTER)
+
+#define COUNTING_GEMM_WARPK_AOS(NAME, T, PAIR, INIT_VAL, BETTER)               \
+extern "C" __global__ void NAME(                                               \
+    const PAIR* __restrict__ pair_a,                                           \
+    const PAIR* __restrict__ pair_b,                                           \
+    T*    __restrict__ value_c, int* __restrict__ count_c,                     \
+    int M, int N, int K, int P, unsigned long long MU                          \
+) {                                                                            \
+    int lane = threadIdx.x;                                                    \
+    int i    = blockIdx.y * blockDim.y + threadIdx.y;                          \
+    int j    = blockIdx.x;                                                     \
+    if (i >= M) return;                                                        \
+                                                                               \
+    T                  acc_val = (INIT_VAL);                                   \
+    unsigned long long acc_cnt = 0;                                            \
+    const unsigned long long Pull = (unsigned long long)P;                     \
+                                                                               \
+    for (int k = lane; k < K; k += 32) {                                       \
+        PAIR a = pair_a[OFFSET_ROW(i, k, K)];                                  \
+        PAIR b = pair_b[OFFSET_ROW(k, j, N)];                                  \
+        T            pv = a.val + b.val;                                       \
+        unsigned int ca = (unsigned int)a.cnt;                                 \
+        unsigned int cb = (unsigned int)b.cnt;                                 \
+        unsigned long long prod = (unsigned long long)ca * (unsigned long long)cb; \
+        unsigned long long pc = barrett_mod(prod, Pull, MU);                   \
+        bool win = BETTER(pv, acc_val);                                        \
+        bool tie = (pv == acc_val);                                            \
+        acc_val  = win ? pv : acc_val;                                         \
+        acc_cnt  = win ? pc                                                    \
+                       : (tie ? barrett_mod(acc_cnt + pc, Pull, MU) : acc_cnt);\
+    }                                                                          \
+                                                                               \
+    for (int off = 16; off > 0; off >>= 1) {                                   \
+        T   ov    = __shfl_xor_sync(0xffffffff, acc_val, off);                 \
+        unsigned int oc_lo = __shfl_xor_sync(                                  \
+            0xffffffff, (unsigned int)(acc_cnt & 0xffffffffULL), off);         \
+        unsigned int oc_hi = __shfl_xor_sync(                                  \
+            0xffffffff, (unsigned int)(acc_cnt >> 32), off);                   \
+        unsigned long long oc =                                                \
+            ((unsigned long long)oc_hi << 32) | (unsigned long long)oc_lo;     \
+        bool win = BETTER(ov, acc_val);                                        \
+        bool tie = (ov == acc_val);                                            \
+        unsigned long long nc = win ? oc                                       \
+            : (tie ? barrett_mod(acc_cnt + oc, Pull, MU) : acc_cnt);           \
+        T nv = win ? ov : acc_val;                                             \
+        acc_val = nv;                                                          \
+        acc_cnt = nc;                                                          \
+    }                                                                          \
+                                                                               \
+    if (lane == 0) {                                                           \
+        value_c[OFFSET_ROW(i, j, N)] = acc_val;                                \
+        count_c[OFFSET_ROW(i, j, N)] = (int)barrett_mod(acc_cnt, Pull, MU);    \
+    }                                                                          \
+}
+
+COUNTING_GEMM_WARPK_AOS(counting_gemm_f32_max_warpk_aos, float,  PairF32, NEG_INF_F32, MAX_BETTER)
+COUNTING_GEMM_WARPK_AOS(counting_gemm_f32_min_warpk_aos, float,  PairF32, POS_INF_F32, MIN_BETTER)
+COUNTING_GEMM_WARPK_AOS(counting_gemm_f64_max_warpk_aos, double, PairF64, NEG_INF_F64, MAX_BETTER)
+COUNTING_GEMM_WARPK_AOS(counting_gemm_f64_min_warpk_aos, double, PairF64, POS_INF_F64, MIN_BETTER)

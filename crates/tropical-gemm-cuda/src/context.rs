@@ -64,18 +64,28 @@ const KERNEL_NAMES: &[&str] = &[
     "tropical_maxmul_f32_nn_batched_with_argmax",
 ];
 
-/// Counting GEMM kernel function names (specs C + E).
+/// Counting GEMM kernel function names (specs C + E + F).
 const COUNTING_KERNEL_NAMES: &[&str] = &[
-    // Naive (spec C): one thread per output cell.
+    // SoA naive (spec C): one thread per output cell, separate value/count buffers.
     "counting_gemm_f32_max",
     "counting_gemm_f32_min",
     "counting_gemm_f64_max",
     "counting_gemm_f64_min",
-    // Warp-K-reduction (spec E, stage A): 32 threads cooperate per cell.
+    // SoA warpk (spec E): 32 threads cooperate per cell.
     "counting_gemm_f32_max_warpk",
     "counting_gemm_f32_min_warpk",
     "counting_gemm_f64_max_warpk",
     "counting_gemm_f64_min_warpk",
+    // AoS naive (spec F): packed (value, count) inputs, one LDG per element.
+    "counting_gemm_f32_max_aos",
+    "counting_gemm_f32_min_aos",
+    "counting_gemm_f64_max_aos",
+    "counting_gemm_f64_min_aos",
+    // AoS warpk (spec F).
+    "counting_gemm_f32_max_warpk_aos",
+    "counting_gemm_f32_min_warpk_aos",
+    "counting_gemm_f64_max_warpk_aos",
+    "counting_gemm_f64_min_warpk_aos",
 ];
 
 /// Dispatch knob #1: minimum K to consider warpk. Below this, the warp-stride

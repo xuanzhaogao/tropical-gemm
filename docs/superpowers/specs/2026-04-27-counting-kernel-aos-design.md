@@ -153,8 +153,48 @@ Extend `bench_kernel_warpk.rs` (or fork to `bench_kernel_aos.rs`) to run AoS-nai
 - **DeviceRepr impl correctness.** Low risk — both types are POD `repr(C)` with no pointer fields. Standard manual impl pattern.
 - **Cross-platform behavior.** PTX uses LD.GLOBAL.E.U64 for 8-byte loads regardless of arch (sm_75 onward). No A100-specific assumption.
 
-## Decision points (need user input before implementing)
+## Decision points (resolved)
 
-1. **Replace SoA kernels in this spec, or keep both as a transition?** Recommendation: keep both for one commit (so AoS-vs-SoA can be A/B benched), then retire SoA in a follow-up.
-2. **f64 cnt as i32-with-pad (16 B element) or i64 (also 16 B but no pad)?** Recommendation: i32-with-pad, matches existing buffer semantics and keeps host-side pack code uniform across f32/f64. The pad is internal kernel detail; callers don't see it.
-3. **Pack inside `count_ground_states_gpu`, or expose a pre-packed input API?** Recommendation: pack inside the driver. The all-ones count case is the only entry point today; future callers with non-trivial counts can be supported by a second entry point later.
+1. Keep SoA kernels alongside AoS for one commit (A/B bench enabled), retire later.
+2. f64 cnt as i32 with 4-byte pad (16 B element), matches existing buffer semantics.
+3. Pack inside `count_ground_states_gpu` driver.
+
+## Outcome (measured 2026-04-27 on A100-SXM4-80GB)
+
+AoS is a clean win at every shape (f32 Max, 1 prime, kernel-only):
+
+**Naive path (square shapes):**
+
+| Size | SoA G/s | AoS G/s | speedup |
+|---|---|---|---|
+| 128² | 133 | 164 | 1.24× |
+| 256² | 356 | 406 | 1.14× |
+| 512² | 504 | 565 | 1.12× |
+| 1024² | 559 | 618 | 1.11× |
+| 2048² | 599 | 675 | 1.13× |
+| **4096²** | **600** | **666** | **1.11×** |
+
+**Warpk path (small-shape regime where warpk dispatch wins):**
+
+| Shape | SoA G/s | AoS G/s | speedup |
+|---|---|---|---|
+| M=N=32, K=4096 | 97 | 166 | **1.71×** |
+| M=N=64, K=4096 | 128 | **246** | **1.92×** |
+| M=N=32, K=2048 | 94 | 154 | 1.64× |
+
+The warpk path benefits much more from AoS because its non-coalesced strided-B reads were memory-transaction-bound; halving the LDG count proportionally lifts throughput. Naive's coalesced pattern was already cache-friendly, so AoS gain is smaller but still positive.
+
+Net effect: stacking AoS on the spec-E warpk dispatch, the small-shape regime now reaches 246 G/s (up from 41 G/s on the original SoA naive kernel — a **6.0× total improvement** for tall-skinny workloads on A100).
+
+**Driver overhead:** the host-side AoS pack adds ~M·K + K·N element copies once before the prime loop (replacing the `vec![1; …]` ones-alloc). Net e2e impact small.
+
+**Tests:** 7 new pair unit tests (layout, alignment, packing roundtrip) + existing 13 counting_gpu integration tests routed through AoS via the driver. All green: 56 lib + 13 integration = 69/69. Committed as `<commit-hash>`.
+
+**Files:**
+- `crates/tropical-gemm-cuda/src/pair.rs` — PairF32/PairF64 + DeviceRepr/ValidAsZeroBits + pack helpers + unit tests.
+- `crates/tropical-gemm-cuda/kernels/counting_gemm.cu` — 8 new AoS kernels (4 naive + 4 warpk).
+- `crates/tropical-gemm-cuda/src/{context.rs, counting_kernel.rs}` — kernel name registry, AoS trait method, AoS launcher.
+- `crates/tropical-gemm-cuda/src/crt.rs` — driver packs once and uses AoS path.
+- `crates/tropical-gemm-cuda/examples/bench_kernel_aos.rs` — head-to-head bench.
+
+**SoA kernel cleanup deferred** to a follow-up (per the rollout plan). They remain reachable via `launch_counting_gemm` for benchmarking, but no production caller uses them.

@@ -14,9 +14,10 @@ use tropical_gemm::types::TropicalDirection;
 use tropical_gemm::CountedMat;
 
 use crate::context::CudaContext;
-use crate::counting_kernel::{launch_counting_gemm, CountingCudaKernel};
+use crate::counting_kernel::{launch_counting_gemm_aos, CountingCudaKernel};
 use crate::error::{CudaError, Result};
 use crate::memory::GpuMatrix;
+use crate::pair::PackPair;
 
 /// GPU version of `tropical_gemm::count_ground_states`. Same semantics,
 /// same caller contract on `count_upper_bound`.
@@ -36,6 +37,7 @@ where
         + Default
         + Clone
         + Copy
+        + PackPair
         + 'static,
     D: TropicalDirection,
     (T, D): CountingCudaKernel<T, D>,
@@ -43,17 +45,16 @@ where
     assert_eq!(a_values.len(), m * k);
     assert_eq!(b_values.len(), k * n);
 
-    // One-shot value upload. Reused across every prime.
-    let value_a = GpuMatrix::<T>::from_host(ctx, a_values, m, k)?;
-    let value_b = GpuMatrix::<T>::from_host(ctx, b_values, k, n)?;
-
-    // Count inputs are `1` everywhere. Upload the ones buffers once.
-    let ones_a_host = vec![1_i32; m * k];
-    let ones_b_host = vec![1_i32; k * n];
-    let count_a = GpuMatrix::<i32>::from_host(ctx, &ones_a_host, m, k)?;
-    let count_b = GpuMatrix::<i32>::from_host(ctx, &ones_b_host, k, n)?;
-    drop(ones_a_host);
-    drop(ones_b_host);
+    // Pack (value, count=1) into AoS once. Counts are all-ones at the entry
+    // point; per-prime kernels then read 8 B (f32) or 16 B (f64) per element
+    // in a single LDG instead of two separate LDG.E.32. Pack runs once,
+    // amortized across the prime loop.
+    let pair_a_host = <T as PackPair>::pack_ones(a_values);
+    let pair_b_host = <T as PackPair>::pack_ones(b_values);
+    let pair_a = GpuMatrix::<<T as PackPair>::Pair>::from_host(ctx, &pair_a_host, m, k)?;
+    let pair_b = GpuMatrix::<<T as PackPair>::Pair>::from_host(ctx, &pair_b_host, k, n)?;
+    drop(pair_a_host);
+    drop(pair_b_host);
 
     // Output buffers reused across primes. GPU-side zero-init (no host→device
     // upload of zero buffers).
@@ -72,12 +73,10 @@ where
     for (i, &prime_idx) in prime_indices.iter().enumerate() {
         let p = CRT_PRIMES[prime_idx];
 
-        launch_counting_gemm::<T, D>(
+        launch_counting_gemm_aos::<T, D>(
             ctx,
-            &value_a,
-            &count_a,
-            &value_b,
-            &count_b,
+            &pair_a,
+            &pair_b,
             &mut value_c,
             &mut count_c,
             p,

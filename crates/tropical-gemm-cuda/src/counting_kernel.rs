@@ -9,17 +9,22 @@
 use crate::context::{CudaContext, COUNTING_WARPK_K_THRESHOLD, COUNTING_WARPK_MN_CEILING};
 use crate::error::Result;
 use crate::memory::GpuMatrix;
+use crate::pair::PackPair;
 use cudarc::driver::{DeviceRepr, LaunchAsync, LaunchConfig, ValidAsZeroBits};
 use tropical_gemm::types::{Max, Min, TropicalDirection};
 
 pub trait CountingCudaKernel<T, D>
 where
-    T: DeviceRepr + ValidAsZeroBits + Default + Clone + Copy + 'static,
+    T: DeviceRepr + ValidAsZeroBits + Default + Clone + Copy + PackPair + 'static,
     D: TropicalDirection,
 {
     const KERNEL_NAME: &'static str;
     /// Warp-K-reduction variant (spec E stage A).
     const KERNEL_NAME_WARPK: &'static str;
+    /// AoS variant: packed (value, count) inputs (spec F).
+    const KERNEL_NAME_AOS: &'static str;
+    /// AoS warp-K-reduction variant (spec F).
+    const KERNEL_NAME_WARPK_AOS: &'static str;
 
     /// Returns (grid_dim, block_dim) for a launch covering `m × n` output cells.
     fn launch_dims(m: usize, n: usize) -> ((u32, u32, u32), (u32, u32, u32));
@@ -112,11 +117,81 @@ where
         ctx.device().synchronize()?;
         Ok(())
     }
+
+    /// AoS variant: takes packed (value, count) input buffers (spec F).
+    /// Output stays SoA. Same shape-aware naive-vs-warpk dispatch as the SoA
+    /// path. This is the preferred entry point — fewer LDG instructions per
+    /// inner-loop step, no per-prime repacking cost.
+    fn launch_counting_gemm_aos(
+        ctx: &CudaContext,
+        pair_a: &GpuMatrix<<T as PackPair>::Pair>,
+        pair_b: &GpuMatrix<<T as PackPair>::Pair>,
+        value_c: &mut GpuMatrix<T>,
+        count_c: &mut GpuMatrix<i32>,
+        modulus: i32,
+    ) -> Result<()> {
+        let m = pair_a.rows();
+        let k = pair_a.cols();
+        let n = pair_b.cols();
+
+        assert_eq!(pair_b.rows(), k);
+        assert_eq!(value_c.rows(), m);
+        assert_eq!(value_c.cols(), n);
+        assert_eq!(count_c.rows(), m);
+        assert_eq!(count_c.cols(), n);
+
+        let use_warpk = k >= COUNTING_WARPK_K_THRESHOLD
+            && m.saturating_mul(n) <= COUNTING_WARPK_MN_CEILING;
+        let kernel_name = if use_warpk {
+            Self::KERNEL_NAME_WARPK_AOS
+        } else {
+            Self::KERNEL_NAME_AOS
+        };
+        let kernel = ctx.get_kernel(kernel_name)?;
+        let (grid_dim, block_dim) = if use_warpk {
+            Self::launch_dims_warpk(m, n)
+        } else {
+            Self::launch_dims(m, n)
+        };
+        let cfg = LaunchConfig {
+            grid_dim,
+            block_dim,
+            shared_mem_bytes: 0,
+        };
+
+        let mu: u64 = if modulus > 1 {
+            ((1u128 << 64) / modulus as u128) as u64
+        } else {
+            0
+        };
+
+        unsafe {
+            kernel.launch(
+                cfg,
+                (
+                    pair_a.as_slice(),
+                    pair_b.as_slice(),
+                    value_c.as_slice_mut(),
+                    count_c.as_slice_mut(),
+                    m as i32,
+                    n as i32,
+                    k as i32,
+                    modulus,
+                    mu,
+                ),
+            )?;
+        }
+
+        ctx.device().synchronize()?;
+        Ok(())
+    }
 }
 
 impl CountingCudaKernel<f32, Max> for (f32, Max) {
     const KERNEL_NAME: &'static str = "counting_gemm_f32_max";
     const KERNEL_NAME_WARPK: &'static str = "counting_gemm_f32_max_warpk";
+    const KERNEL_NAME_AOS: &'static str = "counting_gemm_f32_max_aos";
+    const KERNEL_NAME_WARPK_AOS: &'static str = "counting_gemm_f32_max_warpk_aos";
     fn launch_dims(m: usize, n: usize) -> ((u32, u32, u32), (u32, u32, u32)) {
         (CudaContext::counting_grid_dims_f32(m, n), CudaContext::counting_block_dims_f32())
     }
@@ -124,6 +199,8 @@ impl CountingCudaKernel<f32, Max> for (f32, Max) {
 impl CountingCudaKernel<f32, Min> for (f32, Min) {
     const KERNEL_NAME: &'static str = "counting_gemm_f32_min";
     const KERNEL_NAME_WARPK: &'static str = "counting_gemm_f32_min_warpk";
+    const KERNEL_NAME_AOS: &'static str = "counting_gemm_f32_min_aos";
+    const KERNEL_NAME_WARPK_AOS: &'static str = "counting_gemm_f32_min_warpk_aos";
     fn launch_dims(m: usize, n: usize) -> ((u32, u32, u32), (u32, u32, u32)) {
         (CudaContext::counting_grid_dims_f32(m, n), CudaContext::counting_block_dims_f32())
     }
@@ -131,6 +208,8 @@ impl CountingCudaKernel<f32, Min> for (f32, Min) {
 impl CountingCudaKernel<f64, Max> for (f64, Max) {
     const KERNEL_NAME: &'static str = "counting_gemm_f64_max";
     const KERNEL_NAME_WARPK: &'static str = "counting_gemm_f64_max_warpk";
+    const KERNEL_NAME_AOS: &'static str = "counting_gemm_f64_max_aos";
+    const KERNEL_NAME_WARPK_AOS: &'static str = "counting_gemm_f64_max_warpk_aos";
     fn launch_dims(m: usize, n: usize) -> ((u32, u32, u32), (u32, u32, u32)) {
         (CudaContext::counting_grid_dims_f64(m, n), CudaContext::counting_block_dims_f64())
     }
@@ -138,6 +217,8 @@ impl CountingCudaKernel<f64, Max> for (f64, Max) {
 impl CountingCudaKernel<f64, Min> for (f64, Min) {
     const KERNEL_NAME: &'static str = "counting_gemm_f64_min";
     const KERNEL_NAME_WARPK: &'static str = "counting_gemm_f64_min_warpk";
+    const KERNEL_NAME_AOS: &'static str = "counting_gemm_f64_min_aos";
+    const KERNEL_NAME_WARPK_AOS: &'static str = "counting_gemm_f64_min_warpk_aos";
     fn launch_dims(m: usize, n: usize) -> ((u32, u32, u32), (u32, u32, u32)) {
         (CudaContext::counting_grid_dims_f64(m, n), CudaContext::counting_block_dims_f64())
     }
@@ -154,11 +235,29 @@ pub fn launch_counting_gemm<T, D>(
     modulus: i32,
 ) -> Result<()>
 where
-    T: DeviceRepr + ValidAsZeroBits + Default + Clone + Copy + 'static,
+    T: DeviceRepr + ValidAsZeroBits + Default + Clone + Copy + PackPair + 'static,
     D: TropicalDirection,
     (T, D): CountingCudaKernel<T, D>,
 {
     <(T, D) as CountingCudaKernel<T, D>>::launch_counting_gemm(
         ctx, value_a, count_a, value_b, count_b, value_c, count_c, modulus,
+    )
+}
+
+pub fn launch_counting_gemm_aos<T, D>(
+    ctx: &CudaContext,
+    pair_a: &GpuMatrix<<T as PackPair>::Pair>,
+    pair_b: &GpuMatrix<<T as PackPair>::Pair>,
+    value_c: &mut GpuMatrix<T>,
+    count_c: &mut GpuMatrix<i32>,
+    modulus: i32,
+) -> Result<()>
+where
+    T: DeviceRepr + ValidAsZeroBits + Default + Clone + Copy + PackPair + 'static,
+    D: TropicalDirection,
+    (T, D): CountingCudaKernel<T, D>,
+{
+    <(T, D) as CountingCudaKernel<T, D>>::launch_counting_gemm_aos(
+        ctx, pair_a, pair_b, value_c, count_c, modulus,
     )
 }

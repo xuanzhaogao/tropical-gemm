@@ -49,6 +49,7 @@ mod error;
 mod gpu_mat;
 mod kernels;
 mod memory;
+pub mod pair;
 
 use cudarc::driver::CudaDevice;
 use once_cell::sync::OnceCell;
