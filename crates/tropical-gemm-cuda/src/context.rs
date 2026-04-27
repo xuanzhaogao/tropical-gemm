@@ -64,13 +64,33 @@ const KERNEL_NAMES: &[&str] = &[
     "tropical_maxmul_f32_nn_batched_with_argmax",
 ];
 
-/// Counting GEMM kernel function names (spec C).
+/// Counting GEMM kernel function names (specs C + E).
 const COUNTING_KERNEL_NAMES: &[&str] = &[
+    // Naive (spec C): one thread per output cell.
     "counting_gemm_f32_max",
     "counting_gemm_f32_min",
     "counting_gemm_f64_max",
     "counting_gemm_f64_min",
+    // Warp-K-reduction (spec E, stage A): 32 threads cooperate per cell.
+    "counting_gemm_f32_max_warpk",
+    "counting_gemm_f32_min_warpk",
+    "counting_gemm_f64_max_warpk",
+    "counting_gemm_f64_min_warpk",
 ];
+
+/// Dispatch knob #1: minimum K to consider warpk. Below this, the warp-stride
+/// inner loop has too few iterations to amortize the 5-step shuffle reduce.
+pub const COUNTING_WARPK_K_THRESHOLD: usize = 64;
+
+/// Dispatch knob #2: maximum M*N for warpk. Above this, the GPU has enough
+/// independent output cells that the naive (one-thread-per-cell) coalesced-B
+/// pattern outperforms warpk's strided-B pattern. Measured on A100-80GB:
+/// warpk wins ~3-9x at M*N <= 64*64; naive wins >= 128*128. Threshold sits
+/// just below the crossover.
+pub const COUNTING_WARPK_MN_CEILING: usize = 64 * 64;
+
+/// Block height for warpk kernels (number of output rows per block).
+pub const COUNTING_WARPK_ROWS_PER_BLOCK: u32 = 4;
 
 /// CUDA context for tropical GEMM operations.
 ///
@@ -187,5 +207,18 @@ impl CudaContext {
 
     pub fn counting_grid_dims_f64(m: usize, n: usize) -> (u32, u32, u32) {
         Self::counting_grid_dims_f32(m, n)
+    }
+
+    /// Block dims for warp-K-reduction kernels: 32 lanes × 4 rows-per-block.
+    pub fn counting_warpk_block_dims() -> (u32, u32, u32) {
+        (32, COUNTING_WARPK_ROWS_PER_BLOCK, 1)
+    }
+
+    /// Grid dims for warp-K-reduction kernels: one block per
+    /// (rows-tile, column). gridDim.x = N, gridDim.y = ceil(M / rows-per-block).
+    pub fn counting_warpk_grid_dims(m: usize, n: usize) -> (u32, u32, u32) {
+        let rows = COUNTING_WARPK_ROWS_PER_BLOCK;
+        let gy = ((m as u32) + rows - 1) / rows;
+        (n as u32, gy, 1)
     }
 }

@@ -208,6 +208,39 @@ Update the heuristic to: AoS-warpk for K ≥ 64, naive otherwise. The non-AoS wa
 
 If A is *not* a win on A100 (e.g., L2 traffic from non-coalesced B reads outweighs the K-parallelism gain), pause and reassess before B.
 
+## Outcome (measured 2026-04-27 on A100-SXM4-80GB)
+
+**Stage A landed with shape-aware dispatch.** Headline kernel-only result (1 prime, f32 Max):
+
+| Shape | naive | warpk | warpk speedup |
+|---|---|---|---|
+| 128² (square) | 134 G/s | 103 G/s | 0.77× (loss) |
+| 1024² (square) | 565 G/s | 102 G/s | 0.18× (loss) |
+| 4096² (square) | 600 G/s | 88 G/s | 0.15× (loss) |
+| **M=N=32, K=4096** | 11 G/s | **98 G/s** | **9.0×** |
+| **M=N=64, K=4096** | 41 G/s | **128 G/s** | **3.1×** |
+| M=N=128, K=4096 | 163 G/s | 122 G/s | 0.75× (loss) |
+
+Diagnosis matches the predicted risk: warpk's strided-B reads (32 lanes at fixed `j`, varying `k`, stride N) are catastrophically non-coalesced for large N. Naive's coalesced-B pattern wins decisively whenever M·N is large enough to fill the SMs.
+
+**Dispatch heuristic** (`launch_counting_gemm`):
+
+```
+use_warpk = (K >= 64) && (M*N <= 64*64)
+```
+
+Crossover sits just below the empirical M·N ≈ 128² break-even. Below, warpk is essential — the GPU is parallelism-starved on naive (4096³ work compressed into 32² output cells = 1024 cells, way fewer than the ~7000 concurrent warps the A100 wants).
+
+**Stage B: not pursued in this spec.** The original Stage B layered AoS pair loads on warpk; with warpk now confined to small-shape problems, the absolute gain from B-on-warpk is modest. AoS pair loads applied to the *naive* kernel would attack the dominant large-shape regime — a worthwhile follow-up but a different design (independent of warpk). Defer to a successor spec.
+
+**Tests:** 4 new tests (`warpk_k_threshold_boundary`, `warpk_non_aligned_dims`, `warpk_all_ties_large_k`, `warpk_min_direction_f64`) all pass. Full counting_gpu integration: 13/13 green. Lib tests: 49/49 green.
+
+**Files:**
+- Kernels: `crates/tropical-gemm-cuda/kernels/counting_gemm.cu` (warpk macro + 4 instantiations)
+- Dispatch + thresholds: `crates/tropical-gemm-cuda/src/{context.rs, counting_kernel.rs}`
+- Tests: `crates/tropical-gemm-cuda/tests/counting_gpu.rs`
+- Bench: `crates/tropical-gemm-cuda/examples/bench_kernel_warpk.rs`
+
 ## Risks
 
 - **Non-coalesced B reads.** Acknowledged in the design. Mitigation: rely on A100's L2 (~40 MB) to absorb. If it dominates, a fallback is to flip the warp's role (K-stride along A's row instead, using transposed B) — out of scope for this spec.

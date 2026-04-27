@@ -169,3 +169,75 @@ fn gpu_f64_medium_shape() {
     assert_eq!(gpu.values, cpu.values);
     assert_eq!(gpu.counts, cpu.counts);
 }
+
+// ------------------------------------------------------------------
+// Spec E stage A — warp-K-reduction kernel correctness.
+//
+// Dispatch threshold inside `launch_counting_gemm` is K >= 64. These tests
+// exercise both sides of the threshold and the warpk path's boundary
+// handling (M not divisible by ROWS_PER_BLOCK=4, K not a multiple of 32).
+// ------------------------------------------------------------------
+
+#[test]
+fn warpk_k_threshold_boundary() {
+    let ctx = CudaContext::new().unwrap();
+    for &k in &[32usize, 63, 64, 65, 95, 128] {
+        let (m, n) = (8, 8);
+        let a = random_ish_matrix(m, k, 0xaaaa ^ (k as u64));
+        let b = random_ish_matrix(k, n, 0xbbbb ^ (k as u64));
+        let bound = bound_for_single_matmul(k);
+        let cpu = count_ground_states::<f32, Max>(&a, m, k, &b, n, &bound);
+        let gpu = count_ground_states_gpu::<f32, Max>(&ctx, &a, m, k, &b, n, &bound).unwrap();
+        assert_eq!(gpu.values, cpu.values, "values mismatch at K={}", k);
+        assert_eq!(gpu.counts, cpu.counts, "counts mismatch at K={}", k);
+    }
+}
+
+#[test]
+fn warpk_non_aligned_dims() {
+    // M not divisible by 4 (rows-per-block) -> tail-row predication.
+    // K not a multiple of 32 -> tail-step predication on K-stride.
+    let ctx = CudaContext::new().unwrap();
+    let (m, k, n) = (37, 131, 29);
+    let a = random_ish_matrix(m, k, 0xc0ffee);
+    let b = random_ish_matrix(k, n, 0xfeedface);
+    let bound = bound_for_single_matmul(k);
+    let cpu = count_ground_states::<f32, Max>(&a, m, k, &b, n, &bound);
+    let gpu = count_ground_states_gpu::<f32, Max>(&ctx, &a, m, k, &b, n, &bound).unwrap();
+    assert_eq!(gpu.values, cpu.values);
+    assert_eq!(gpu.counts, cpu.counts);
+}
+
+#[test]
+fn warpk_all_ties_large_k() {
+    // K=200 forces warpk path; all inputs equal -> every k contributes the
+    // same product. Exercises tropical-add tie-handling under warp shuffle
+    // reduction (every reduction step is a tie).
+    let ctx = CudaContext::new().unwrap();
+    let (m, k, n) = (5, 200, 7);
+    let a = vec![0.0_f32; m * k];
+    let b = vec![0.0_f32; k * n];
+    let bound = bound_for_single_matmul(k);
+    let gpu = count_ground_states_gpu::<f32, Max>(&ctx, &a, m, k, &b, n, &bound).unwrap();
+    assert_eq!(gpu.values, vec![0.0; m * n]);
+    assert_eq!(gpu.counts, vec![BigInt::from(k); m * n]);
+}
+
+#[test]
+fn warpk_min_direction_f64() {
+    // Cover Min + f64 paths for warpk dispatch.
+    let ctx = CudaContext::new().unwrap();
+    let (m, k, n) = (6, 80, 9);
+    let mut state: u64 = 0xdeadbeef;
+    let mut gen = || {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((state >> 33) as u32 % 5) as f64
+    };
+    let a: Vec<f64> = (0..m * k).map(|_| gen()).collect();
+    let b: Vec<f64> = (0..k * n).map(|_| gen()).collect();
+    let bound = bound_for_single_matmul(k);
+    let cpu = count_ground_states::<f64, Min>(&a, m, k, &b, n, &bound);
+    let gpu = count_ground_states_gpu::<f64, Min>(&ctx, &a, m, k, &b, n, &bound).unwrap();
+    assert_eq!(gpu.values, cpu.values);
+    assert_eq!(gpu.counts, cpu.counts);
+}
