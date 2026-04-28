@@ -91,6 +91,23 @@ const COUNTING_KERNEL_NAMES: &[&str] = &[
     "counting_gemm_f32_min_warpk_ones",
     "counting_gemm_f64_max_warpk_ones",
     "counting_gemm_f64_min_warpk_ones",
+    // Spec M: column-major NN/NT/TN/TT specializations.
+    "tropical_matmul_f32_max_NN",
+    "tropical_matmul_f32_max_NT",
+    "tropical_matmul_f32_max_TN",
+    "tropical_matmul_f32_max_TT",
+    "tropical_matmul_f32_min_NN",
+    "tropical_matmul_f32_min_NT",
+    "tropical_matmul_f32_min_TN",
+    "tropical_matmul_f32_min_TT",
+    "tropical_matmul_f64_max_NN",
+    "tropical_matmul_f64_max_NT",
+    "tropical_matmul_f64_max_TN",
+    "tropical_matmul_f64_max_TT",
+    "tropical_matmul_f64_min_NN",
+    "tropical_matmul_f64_min_NT",
+    "tropical_matmul_f64_min_TN",
+    "tropical_matmul_f64_min_TT",
 ];
 
 /// Dispatch knob #1: minimum K to consider warpk. Below this, the warp-stride
