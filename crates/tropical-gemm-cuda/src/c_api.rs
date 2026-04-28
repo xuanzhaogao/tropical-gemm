@@ -43,7 +43,7 @@ use crate::error::CudaError;
 use crate::get_global_context;
 use crate::memory::GpuMatrix;
 use crate::pair::PackPair;
-use crate::matmul_mod::{matmul_mod_p, matmul_mod_p_kernel_only, matmul_mod_p_pair};
+use crate::matmul_mod::{matmul_mod_p, matmul_mod_p_kernel_only, matmul_mod_p_pair, tropical_matmul_kernel};
 
 /// Bumped on any source-incompatible C ABI change. The Julia binding (or
 /// any other ABI consumer) is expected to assert this at load time.
@@ -489,6 +489,94 @@ cabi_matmul_mod_p_pair_dev!(tg_matmul_mod_p_pair_dev_f64_max, f64, Max);
 cabi_matmul_mod_p_pair_dev!(tg_matmul_mod_p_pair_dev_f64_min, f64, Min);
 
 // ---------------------------------------------------------------------------
+// Spec M: column-major BLAS-style mod-P counting tropical matmul.
+// Caller-owned device buffers; flags select the (transA, transB) kernel.
+// ---------------------------------------------------------------------------
+
+fn run_tropical_matmul<T, D>(
+    tA: i8, tB: i8,
+    m: usize, k: usize, n: usize,
+    a_dev: u64, b_dev: u64,
+    p: i32,
+    out_dev: u64,
+) -> i32
+where
+    T: tropical_gemm::types::TropicalScalar
+        + cudarc::driver::DeviceRepr
+        + cudarc::driver::ValidAsZeroBits
+        + Default + Clone + Copy
+        + crate::pair::PackPair
+        + 'static,
+    D: tropical_gemm::types::TropicalDirection,
+    (T, D): crate::counting_kernel::TropicalMatmulKernelName<T, D>,
+    (T, D): crate::counting_kernel::CountingCudaKernel<T, D>,
+{
+    let tA_char = tA as u8 as char;
+    let tB_char = tB as u8 as char;
+    if tA_char != 'N' && tA_char != 'T' {
+        store_error(format!("tA must be 'N' or 'T', got {:?}", tA_char));
+        return ERR_INVALID_INPUT;
+    }
+    if tB_char != 'N' && tB_char != 'T' {
+        store_error(format!("tB must be 'N' or 'T', got {:?}", tB_char));
+        return ERR_INVALID_INPUT;
+    }
+    if p < 2 {
+        store_error(format!("modulus must be >= 2, got {}", p));
+        return ERR_INVALID_INPUT;
+    }
+    if m == 0 || k == 0 || n == 0 {
+        store_error("dimensions must be non-zero");
+        return ERR_INVALID_INPUT;
+    }
+    if a_dev == 0 || b_dev == 0 || out_dev == 0 {
+        store_error("null device pointer");
+        return ERR_INVALID_INPUT;
+    }
+
+    let ctx = match get_global_context() {
+        Ok(c) => c,
+        Err(e) => {
+            store_error(format!("CUDA context init failed: {}", e));
+            return ERR_CUDA;
+        }
+    };
+
+    match tropical_matmul_kernel::<T, D>(
+        ctx, tA_char, tB_char, m, k, n, a_dev, b_dev, p, out_dev,
+    ) {
+        Ok(()) => OK,
+        Err(e) => { store_error(format!("{}", e)); ERR_CUDA }
+    }
+}
+
+macro_rules! cabi_tropical_matmul {
+    ($name:ident, $T:ty, $D:ty) => {
+        #[no_mangle]
+        pub extern "C" fn $name(
+            tA: i8, tB: i8,
+            m: usize, k: usize, n: usize,
+            a_dev: u64, b_dev: u64,
+            p: i32,
+            out_dev: u64,
+        ) -> c_int {
+            let res = catch_unwind(AssertUnwindSafe(|| {
+                run_tropical_matmul::<$T, $D>(tA, tB, m, k, n, a_dev, b_dev, p, out_dev)
+            }));
+            match res {
+                Ok(code) => code,
+                Err(_) => { store_error("Rust panic across FFI boundary"); ERR_INTERNAL }
+            }
+        }
+    };
+}
+
+cabi_tropical_matmul!(tg_tropical_matmul_f32_max, f32, Max);
+cabi_tropical_matmul!(tg_tropical_matmul_f32_min, f32, Min);
+cabi_tropical_matmul!(tg_tropical_matmul_f64_max, f64, Max);
+cabi_tropical_matmul!(tg_tropical_matmul_f64_min, f64, Min);
+
+// ---------------------------------------------------------------------------
 // Kernel-only timing: upload data once, run the kernel `iters` times, and
 // return the average per-launch wall time in milliseconds. Bypasses CRT
 // combine and BigInt/u64 reconstruction entirely. For perf measurement
@@ -784,6 +872,47 @@ mod tests {
             b_val.as_ptr(), b_cnt.as_ptr(), 2,
             1,    // p=1 invalid
             out_val.as_mut_ptr(), out_cnt.as_mut_ptr(),
+        );
+        assert_eq!(code, ERR_INVALID_INPUT);
+    }
+
+    #[test]
+    fn tg_tropical_matmul_f32_max_nn_smoke() {
+        use crate::pair::PairF32;
+        let ctx = crate::get_global_context().expect("CUDA ctx");
+        let pair_a_host = vec![
+            PairF32::new(1.0, 1), PairF32::new(3.0, 1),
+            PairF32::new(2.0, 1), PairF32::new(4.0, 1),
+        ];
+        let pair_b_host = vec![
+            PairF32::new(5.0, 1), PairF32::new(7.0, 1),
+            PairF32::new(6.0, 1), PairF32::new(8.0, 1),
+        ];
+        let pair_a_dev = ctx.device().htod_copy(pair_a_host).unwrap();
+        let pair_b_dev = ctx.device().htod_copy(pair_b_host).unwrap();
+        let out_dev = ctx.device().alloc_zeros::<PairF32>(4).unwrap();
+
+        use cudarc::driver::DevicePtr;
+        let code = tg_tropical_matmul_f32_max(
+            b'N' as i8, b'N' as i8,
+            2, 2, 2,
+            *pair_a_dev.device_ptr(),
+            *pair_b_dev.device_ptr(),
+            7,
+            *out_dev.device_ptr(),
+        );
+        assert_eq!(code, OK);
+        let out = ctx.device().dtoh_sync_copy(&out_dev).unwrap();
+        assert_eq!(out[0].val, 9.0);
+        assert_eq!(out[1].val, 11.0);
+        assert_eq!(out[2].val, 10.0);
+        assert_eq!(out[3].val, 12.0);
+    }
+
+    #[test]
+    fn tg_tropical_matmul_rejects_bad_flag() {
+        let code = tg_tropical_matmul_f32_max(
+            b'X' as i8, b'N' as i8, 2, 2, 2, 0, 0, 7, 0,
         );
         assert_eq!(code, ERR_INVALID_INPUT);
     }
