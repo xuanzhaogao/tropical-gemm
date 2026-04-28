@@ -43,6 +43,7 @@
 //! compilation overhead on each call.
 
 pub mod c_api;
+pub mod matmul_mod;
 mod context;
 pub(crate) mod counting_kernel;
 pub mod crt;

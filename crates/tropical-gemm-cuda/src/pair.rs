@@ -73,16 +73,23 @@ pub fn pack_f64_ones(values: &[f64]) -> Vec<PairF64> {
 pub trait PackPair: Copy {
     type Pair: DeviceRepr + ValidAsZeroBits + Default + Clone + Copy + 'static;
     fn pack_ones(values: &[Self]) -> Vec<Self::Pair>;
+    fn pack_pair(values: &[Self], counts: &[i32]) -> Vec<Self::Pair>;
 }
 
 impl PackPair for f32 {
     type Pair = PairF32;
     fn pack_ones(values: &[Self]) -> Vec<Self::Pair> { pack_f32_ones(values) }
+    fn pack_pair(values: &[Self], counts: &[i32]) -> Vec<Self::Pair> {
+        pack_f32(values, counts)
+    }
 }
 
 impl PackPair for f64 {
     type Pair = PairF64;
     fn pack_ones(values: &[Self]) -> Vec<Self::Pair> { pack_f64_ones(values) }
+    fn pack_pair(values: &[Self], counts: &[i32]) -> Vec<Self::Pair> {
+        pack_f64(values, counts)
+    }
 }
 
 #[cfg(test)]
