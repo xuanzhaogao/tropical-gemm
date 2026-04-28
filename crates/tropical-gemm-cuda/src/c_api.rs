@@ -43,7 +43,7 @@ use crate::error::CudaError;
 use crate::get_global_context;
 use crate::memory::GpuMatrix;
 use crate::pair::PackPair;
-use crate::matmul_mod::{matmul_mod_p, matmul_mod_p_pair};
+use crate::matmul_mod::{matmul_mod_p, matmul_mod_p_kernel_only, matmul_mod_p_pair};
 
 /// Bumped on any source-incompatible C ABI change. The Julia binding (or
 /// any other ABI consumer) is expected to assert this at load time.
@@ -390,6 +390,105 @@ cabi_matmul_mod_p_pair!(tg_matmul_mod_p_pair_f64_max, f64, Max);
 cabi_matmul_mod_p_pair!(tg_matmul_mod_p_pair_f64_min, f64, Min);
 
 // ---------------------------------------------------------------------------
+// Spec L: device-pointer mod-P matmul. Caller owns the four device buffers
+// (e.g. CUDA.jl); Rust just launches the kernel — no cudaMalloc, no
+// cudaMemcpy. Pointers are raw `CUdeviceptr` shipped as `u64` over FFI.
+//
+// Safety contract (caller asserts):
+//   - All four pointers reference valid device memory in the primary CUDA
+//     context (which both this crate via cudarc and CUDA.jl share).
+//   - `pair_a_dev` covers `m * k` `<T as PackPair>::Pair` elements.
+//   - `pair_b_dev` covers `k * n` `<T as PackPair>::Pair` elements.
+//   - `out_val_dev` covers `m * n` `T` elements.
+//   - `out_cnt_dev` covers `m * n` `i32` elements.
+//   - Buffers stay valid until the call returns.
+//
+// `matmul_mod_p_kernel_only` calls `device().synchronize()` before the
+// kernel launch to ensure any prior caller-stream operations (uploads
+// from CUDA.jl in particular) are visible to the kernel — without this
+// the kernel can race the upload across streams.
+// ---------------------------------------------------------------------------
+
+fn run_matmul_mod_p_pair_dev<T, D>(
+    pair_a_dev: u64,
+    m: usize,
+    k: usize,
+    pair_b_dev: u64,
+    n: usize,
+    p: i32,
+    out_val_dev: u64,
+    out_cnt_dev: u64,
+) -> i32
+where
+    T: tropical_gemm::types::TropicalScalar
+        + cudarc::driver::DeviceRepr
+        + cudarc::driver::ValidAsZeroBits
+        + Default + Clone + Copy
+        + crate::pair::PackPair
+        + 'static,
+    D: tropical_gemm::types::TropicalDirection,
+    (T, D): crate::counting_kernel::CountingCudaKernel<T, D>,
+{
+    if pair_a_dev == 0 || pair_b_dev == 0 || out_val_dev == 0 || out_cnt_dev == 0 {
+        store_error("null device pointer");
+        return ERR_INVALID_INPUT;
+    }
+    if m == 0 || k == 0 || n == 0 {
+        store_error("dimensions must be non-zero");
+        return ERR_INVALID_INPUT;
+    }
+    if p < 2 {
+        store_error(format!("modulus must be >= 2, got {}", p));
+        return ERR_INVALID_INPUT;
+    }
+
+    let ctx = match get_global_context() {
+        Ok(c) => c,
+        Err(e) => {
+            store_error(format!("CUDA context init failed: {}", e));
+            return ERR_CUDA;
+        }
+    };
+
+    match matmul_mod_p_kernel_only::<T, D>(
+        ctx, pair_a_dev, m, k, pair_b_dev, n, p, out_val_dev, out_cnt_dev,
+    ) {
+        Ok(()) => OK,
+        Err(e) => { store_error(format!("{}", e)); ERR_CUDA }
+    }
+}
+
+macro_rules! cabi_matmul_mod_p_pair_dev {
+    ($name:ident, $T:ty, $D:ty) => {
+        #[no_mangle]
+        pub extern "C" fn $name(
+            pair_a_dev: u64,
+            m: usize, k: usize,
+            pair_b_dev: u64,
+            n: usize,
+            p: i32,
+            out_val_dev: u64,
+            out_cnt_dev: u64,
+        ) -> c_int {
+            let res = catch_unwind(AssertUnwindSafe(|| {
+                run_matmul_mod_p_pair_dev::<$T, $D>(
+                    pair_a_dev, m, k, pair_b_dev, n, p, out_val_dev, out_cnt_dev,
+                )
+            }));
+            match res {
+                Ok(code) => code,
+                Err(_) => { store_error("Rust panic across FFI boundary"); ERR_INTERNAL }
+            }
+        }
+    };
+}
+
+cabi_matmul_mod_p_pair_dev!(tg_matmul_mod_p_pair_dev_f32_max, f32, Max);
+cabi_matmul_mod_p_pair_dev!(tg_matmul_mod_p_pair_dev_f32_min, f32, Min);
+cabi_matmul_mod_p_pair_dev!(tg_matmul_mod_p_pair_dev_f64_max, f64, Max);
+cabi_matmul_mod_p_pair_dev!(tg_matmul_mod_p_pair_dev_f64_min, f64, Min);
+
+// ---------------------------------------------------------------------------
 // Kernel-only timing: upload data once, run the kernel `iters` times, and
 // return the average per-launch wall time in milliseconds. Bypasses CRT
 // combine and BigInt/u64 reconstruction entirely. For perf measurement
@@ -630,6 +729,48 @@ mod tests {
         assert_eq!(code, OK);
         assert_eq!(out_val, vec![9.0_f32, 10.0, 11.0, 12.0]);
         assert_eq!(out_cnt, vec![1_i32, 1, 1, 1]);
+    }
+
+    #[test]
+    fn matmul_mod_p_pair_dev_f32_max_smoke() {
+        // Spec L: allocate via cudarc (mimicking CUDA.jl ownership), pass raw
+        // CUdeviceptr to the kernel-only C ABI, verify result.
+        use cudarc::driver::DevicePtr;
+        use crate::pair::PairF32;
+
+        let ctx = crate::get_global_context().expect("CUDA ctx");
+        let pair_a_host = vec![
+            PairF32::new(1.0, 1), PairF32::new(2.0, 1),
+            PairF32::new(3.0, 1), PairF32::new(4.0, 1),
+        ];
+        let pair_b_host = vec![
+            PairF32::new(5.0, 1), PairF32::new(6.0, 1),
+            PairF32::new(7.0, 1), PairF32::new(8.0, 1),
+        ];
+        let pair_a_dev = ctx.device().htod_copy(pair_a_host).expect("upload A");
+        let pair_b_dev = ctx.device().htod_copy(pair_b_host).expect("upload B");
+        let out_val_dev = ctx.device().alloc_zeros::<f32>(4).expect("alloc out_val");
+        let out_cnt_dev = ctx.device().alloc_zeros::<i32>(4).expect("alloc out_cnt");
+
+        let code = tg_matmul_mod_p_pair_dev_f32_max(
+            *pair_a_dev.device_ptr(), 2, 2,
+            *pair_b_dev.device_ptr(), 2,
+            7,
+            *out_val_dev.device_ptr(),
+            *out_cnt_dev.device_ptr(),
+        );
+        assert_eq!(code, OK);
+
+        let out_val = ctx.device().dtoh_sync_copy(&out_val_dev).expect("dl v");
+        let out_cnt = ctx.device().dtoh_sync_copy(&out_cnt_dev).expect("dl c");
+        assert_eq!(out_val, vec![9.0_f32, 10.0, 11.0, 12.0]);
+        assert_eq!(out_cnt, vec![1_i32, 1, 1, 1]);
+    }
+
+    #[test]
+    fn matmul_mod_p_pair_dev_null_returns_invalid() {
+        let code = tg_matmul_mod_p_pair_dev_f32_max(0, 2, 2, 0, 2, 7, 0, 0);
+        assert_eq!(code, ERR_INVALID_INPUT);
     }
 
     #[test]
