@@ -1,8 +1,9 @@
 //! GPU vs CPU cross-check for count_ground_states (spec C).
 
 use num_bigint::BigInt;
+use tropical_gemm::crt::bound_for_single_matmul_u64;
 use tropical_gemm::{bound_for_single_matmul, count_ground_states, Max, Min};
-use tropical_gemm_cuda::{count_ground_states_gpu, CudaContext};
+use tropical_gemm_cuda::{count_ground_states_gpu, count_ground_states_gpu_u64, CudaContext};
 
 fn random_ish_matrix(rows: usize, cols: usize, seed: u64) -> Vec<f32> {
     let mut state = seed.wrapping_add(0x9e3779b97f4a7c15);
@@ -330,4 +331,70 @@ fn ones_all_ties_large_k_warpk() {
     let gpu = count_ground_states_gpu::<f32, Max>(&ctx, &a, m, k, &b, n, &bound).unwrap();
     assert_eq!(gpu.values, vec![0.0; m * n]);
     assert_eq!(gpu.counts, vec![BigInt::from(k); m * n]);
+}
+
+// ------------------------------------------------------------------
+// Spec I — u64 fast-path correctness.
+// ------------------------------------------------------------------
+
+#[test]
+fn u64_matches_bigint_single_prime() {
+    let ctx = CudaContext::new().unwrap();
+    let (m, k, n) = (16, 24, 12);
+    let a = random_ish_matrix(m, k, 0xc0c0);
+    let b = random_ish_matrix(k, n, 0xd0d0);
+    let bound = bound_for_single_matmul_u64(k);
+    let bound_big = bound_for_single_matmul(k);
+
+    let big = count_ground_states_gpu::<f32, Max>(&ctx, &a, m, k, &b, n, &bound_big).unwrap();
+    let u64_ = count_ground_states_gpu_u64::<f32, Max>(&ctx, &a, m, k, &b, n, bound).unwrap();
+
+    assert_eq!(u64_.values, big.values);
+    for i in 0..m * n {
+        assert_eq!(BigInt::from(u64_.counts[i]), big.counts[i],
+                   "cell {} mismatch", i);
+    }
+}
+
+#[test]
+fn u64_matches_bigint_two_primes() {
+    // Force a 2-prime CRT by passing a bound > 2^30.
+    let ctx = CudaContext::new().unwrap();
+    let (m, k, n) = (8, 64, 8);
+    let a = random_ish_matrix(m, k, 0xeeee);
+    let b = random_ish_matrix(k, n, 0xffff);
+    let bound = (1u64 << 31) + 7;
+    let bound_big = BigInt::from(bound);
+
+    let big = count_ground_states_gpu::<f32, Max>(&ctx, &a, m, k, &b, n, &bound_big).unwrap();
+    let u64_ = count_ground_states_gpu_u64::<f32, Max>(&ctx, &a, m, k, &b, n, bound).unwrap();
+
+    assert_eq!(u64_.values, big.values);
+    for i in 0..m * n {
+        assert_eq!(BigInt::from(u64_.counts[i]), big.counts[i],
+                   "cell {} mismatch", i);
+    }
+}
+
+#[test]
+fn u64_rejects_too_large_bound() {
+    let ctx = CudaContext::new().unwrap();
+    let (m, k, n) = (4, 4, 4);
+    let a = random_ish_matrix(m, k, 0x1);
+    let b = random_ish_matrix(k, n, 0x2);
+    let bound = 1u64 << 62;
+    let r = count_ground_states_gpu_u64::<f32, Max>(&ctx, &a, m, k, &b, n, bound);
+    assert!(r.is_err(), "expected error for too-large u64 bound");
+}
+
+#[test]
+fn u64_all_ties_large_k_warpk() {
+    let ctx = CudaContext::new().unwrap();
+    let (m, k, n) = (5, 200, 7);
+    let a = vec![0.0_f32; m * k];
+    let b = vec![0.0_f32; k * n];
+    let bound = bound_for_single_matmul_u64(k);
+    let gpu = count_ground_states_gpu_u64::<f32, Max>(&ctx, &a, m, k, &b, n, bound).unwrap();
+    assert_eq!(gpu.values, vec![0.0; m * n]);
+    assert_eq!(gpu.counts, vec![k as u64; m * n]);
 }

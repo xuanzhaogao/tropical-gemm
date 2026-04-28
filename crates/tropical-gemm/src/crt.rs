@@ -253,6 +253,91 @@ pub fn bound_for_single_matmul(k: usize) -> BigInt {
     BigInt::from(k)
 }
 
+/// u64 variant of `bound_for_single_matmul` for the u64 fast-path.
+pub fn bound_for_single_matmul_u64(k: usize) -> u64 {
+    k as u64
+}
+
+/// Modular inverse `a^{-1} mod m` via extended Euclidean. `m` must be prime
+/// (or at least coprime with `a`); both fit in `i64` (CRT_PRIMES are < 2^31).
+fn modinv_u64(a: u64, m: u64) -> u64 {
+    let (mut t, mut new_t): (i64, i64) = (0, 1);
+    let (mut r, mut new_r): (i64, i64) = (m as i64, a as i64);
+    while new_r != 0 {
+        let q = r / new_r;
+        let tmp_t = t - q * new_t;
+        t = new_t;
+        new_t = tmp_t;
+        let tmp_r = r - q * new_r;
+        r = new_r;
+        new_r = tmp_r;
+    }
+    debug_assert_eq!(r, 1, "modinv_u64: a not invertible mod m");
+    if t < 0 {
+        (t + m as i64) as u64
+    } else {
+        t as u64
+    }
+}
+
+/// u64 CRT combine: like [`crt_combine`] but operating directly in `u64`
+/// without BigInt allocation. Caller must ensure `acc_modulus * prime` fits
+/// in `u64` (true for ≤ 2 of the 30-bit `CRT_PRIMES`).
+///
+/// Preconditions:
+///   - `0 <= acc_value < acc_modulus`
+///   - `0 <= residue < prime`
+///   - `gcd(acc_modulus, prime) == 1`
+pub fn crt_combine_u64(
+    acc_value: u64,
+    acc_modulus: u64,
+    residue: i32,
+    prime: i32,
+) -> (u64, u64) {
+    debug_assert!(prime > 0);
+    debug_assert!((residue as i64) >= 0 && (residue as i64) < (prime as i64));
+    debug_assert!(acc_value < acc_modulus);
+
+    let p = prime as u64;
+    let r = residue as u64;
+    // diff = (residue - acc_value) mod prime, computed without underflow.
+    let acc_mod_p = acc_value % p;
+    let diff = (r + p - acc_mod_p) % p;
+    let inv = modinv_u64(acc_modulus % p, p);
+    let delta = (diff * inv) % p;
+    let new_modulus = acc_modulus
+        .checked_mul(p)
+        .expect("crt_combine_u64: new modulus overflows u64");
+    // acc_modulus < 2^30, delta < 2^30 -> product < 2^60. acc_value < 2^30.
+    // Sum < 2^61 — within u64 range.
+    let new_value = acc_value + acc_modulus * delta;
+    debug_assert!(new_value < new_modulus);
+    (new_value, new_modulus)
+}
+
+/// u64 variant of [`choose_primes`]. Returns `Some((indices, product))` when
+/// a prefix of `CRT_PRIMES` satisfies `product > needed` AND fits in u63 (so
+/// downstream `u64` reconstructions stay within a positive `i64` range too).
+/// Returns `None` when no such prefix exists.
+pub fn choose_primes_u64(needed: u64) -> Option<(Vec<usize>, u64)> {
+    let max_product = 1u64 << 63;
+    let mut product = 1u64;
+    let mut indices = Vec::new();
+    for (i, &p) in CRT_PRIMES.iter().enumerate() {
+        let p_u64 = p as u64;
+        let new_product = product.checked_mul(p_u64)?;
+        if new_product >= max_product {
+            return None;
+        }
+        indices.push(i);
+        product = new_product;
+        if product > needed {
+            return Some((indices, product));
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -348,5 +433,59 @@ mod tests {
         let r = count_ground_states::<f32, Min>(&a, 1, 2, &b, 1, &bound);
         assert_eq!(r.values, vec![5.0]);
         assert_eq!(r.counts, vec![BigInt::from(2)]);
+    }
+
+    // ------------------------------------------------------------------
+    // u64 fast-path helpers (Spec I).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn crt_combine_u64_matches_bigint() {
+        // Random-ish residues across the first two primes.
+        let p0 = CRT_PRIMES[0];
+        let p1 = CRT_PRIMES[1];
+        let mut state: u64 = 0xdeadbeef;
+        for _ in 0..1000 {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let r0 = ((state >> 33) as u32 % p0 as u32) as i32;
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let r1 = ((state >> 33) as u32 % p1 as u32) as i32;
+
+            let (v_u64, m_u64) = crt_combine_u64(r0 as u64, p0 as u64, r1, p1);
+            let (v_big, m_big) = crt_combine(&BigInt::from(r0), &BigInt::from(p0), r1, p1);
+
+            assert_eq!(BigInt::from(v_u64), v_big, "value mismatch r0={} r1={}", r0, r1);
+            assert_eq!(BigInt::from(m_u64), m_big, "modulus mismatch");
+        }
+    }
+
+    #[test]
+    fn choose_primes_u64_picks_minimal_prefix() {
+        // Single prime suffices for small bounds.
+        let (idx, prod) = choose_primes_u64(5).unwrap();
+        assert_eq!(idx, vec![0]);
+        assert!(prod > 5);
+
+        // Two primes for bounds beyond 2^30.
+        let (idx, prod) = choose_primes_u64(1u64 << 31).unwrap();
+        assert_eq!(idx.len(), 2);
+        assert!(prod > (1u64 << 31));
+        assert!(prod < (1u64 << 63));
+    }
+
+    #[test]
+    fn choose_primes_u64_rejects_overflow() {
+        // Bound exceeds 2^63 (would need ≥3 of the 30-bit primes).
+        // 2 * 2^30 * 2^30 > 2^61 > 2^63? No: 2 * 2^60 = 2^61 < 2^63.
+        // Three primes: ~2^90 — overflows u64.
+        // Pick a needed > 2 * 30-bit prime product (~2^60).
+        assert!(choose_primes_u64(1u64 << 62).is_none());
+    }
+
+    #[test]
+    fn bound_for_single_matmul_u64_matches_bigint() {
+        for &k in &[1usize, 10, 1000, 1_000_000] {
+            assert_eq!(BigInt::from(bound_for_single_matmul_u64(k)), bound_for_single_matmul(k));
+        }
     }
 }

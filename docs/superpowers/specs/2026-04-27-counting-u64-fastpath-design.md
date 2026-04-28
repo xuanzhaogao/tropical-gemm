@@ -151,3 +151,30 @@ Add `examples/bench_e2e.rs` (or extend `bench_counting`) to time the **driver** 
 - Python-binding for u64 path. Separate work.
 - Auto-routing inside `count_ground_states_gpu` to detect u64 eligibility and skip BigInt construction internally. Possible but adds an output-type-erasure complication; cleaner to give callers two entry points.
 - Removing BigInt path. Stays for general use.
+
+## Outcome (measured 2026-04-27 on A100-SXM4-80GB)
+
+**~8-15× e2e speedup**, exceeding the predicted ~5×. End-to-end driver bench (f32 Max, single matmul, all-ones counts):
+
+| Size | BigInt ms | u64 ms | speedup |
+|---|---|---|---|
+| 256² | 3.54 | 0.26 | 13.50× |
+| 512² | 13.92 | 0.91 | 15.36× |
+| 1024² | 63.14 | 8.38 | 7.53× |
+| **2048²** | 292.46 | **29.79** | **9.82×** |
+| **4096²** | 1237.90 | **152.28** | **8.13×** |
+
+The BigInt path's per-cell allocation dominated even more than the original memory-profile suggested. At 2048², e2e dropped from 292 ms → 30 ms; at 4096², from 1238 ms → 152 ms.
+
+Cumulative e2e improvement on this branch (Apr 21 → today) at 2048²: **459 ms → 30 ms ≈ 15× e2e**, on top of the 39× kernel-only progress.
+
+**Tests:** 21/21 integration green (4 new u64 tests + 17 prior). 60/60 lib green (4 new CPU u64 helper tests + 56 prior).
+
+**Files:**
+- `crates/tropical-gemm/src/crt.rs` — `crt_combine_u64`, `choose_primes_u64`, `bound_for_single_matmul_u64`, `modinv_u64` + 4 unit tests.
+- `crates/tropical-gemm-cuda/src/crt.rs` — refactored `run_kernels_per_prime` shared helper; new `count_ground_states_gpu_u64` + `CountedMatU64`.
+- `crates/tropical-gemm-cuda/src/lib.rs` — re-exports.
+- `crates/tropical-gemm-cuda/tests/counting_gpu.rs` — 4 new u64 tests.
+- `crates/tropical-gemm-cuda/examples/bench_e2e_u64.rs` — e2e head-to-head bench.
+
+BigInt entry point unchanged in behavior; both paths share kernel work via `run_kernels_per_prime`. Existing callers continue to work without modification.
