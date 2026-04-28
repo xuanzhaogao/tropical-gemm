@@ -31,12 +31,18 @@ use std::os::raw::c_int;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 use std::cell::RefCell;
+use std::time::Instant;
 
+use tropical_gemm::crt::{choose_primes_u64, CRT_PRIMES};
 use tropical_gemm::types::{Max, Min};
 
+use crate::context::{COUNTING_WARPK_K_THRESHOLD, COUNTING_WARPK_MN_CEILING};
+use crate::counting_kernel::{launch_counting_gemm_ones, CountingCudaKernel};
 use crate::crt::count_ground_states_gpu_u64;
 use crate::error::CudaError;
 use crate::get_global_context;
+use crate::memory::GpuMatrix;
+use crate::pair::PackPair;
 
 /// Bumped on any source-incompatible C ABI change. The Julia binding (or
 /// any other ABI consumer) is expected to assert this at load time.
@@ -191,6 +197,169 @@ cabi_count_ground_states_u64!(tg_count_ground_states_gpu_u64_f32_max, f32, Max);
 cabi_count_ground_states_u64!(tg_count_ground_states_gpu_u64_f32_min, f32, Min);
 cabi_count_ground_states_u64!(tg_count_ground_states_gpu_u64_f64_max, f64, Max);
 cabi_count_ground_states_u64!(tg_count_ground_states_gpu_u64_f64_min, f64, Min);
+
+// ---------------------------------------------------------------------------
+// Kernel-only timing: upload data once, run the kernel `iters` times, and
+// return the average per-launch wall time in milliseconds. Bypasses CRT
+// combine and BigInt/u64 reconstruction entirely. For perf measurement
+// from non-Rust callers (Julia bench, etc.).
+// ---------------------------------------------------------------------------
+
+fn bench_kernel_only_impl<T, D>(
+    a: *const T,
+    m: usize,
+    k: usize,
+    b: *const T,
+    n: usize,
+    bound: u64,
+    iters: u32,
+    out_avg_ms: *mut f64,
+) -> i32
+where
+    T: tropical_gemm::types::TropicalScalar
+        + cudarc::driver::DeviceRepr
+        + cudarc::driver::ValidAsZeroBits
+        + Default
+        + Clone
+        + Copy
+        + PackPair
+        + 'static,
+    D: tropical_gemm::types::TropicalDirection,
+    (T, D): CountingCudaKernel<T, D>,
+{
+    if a.is_null() || b.is_null() || out_avg_ms.is_null() {
+        store_error("null pointer");
+        return ERR_INVALID_INPUT;
+    }
+    if m == 0 || k == 0 || n == 0 || iters == 0 {
+        store_error("dimensions and iters must be non-zero");
+        return ERR_INVALID_INPUT;
+    }
+
+    let ctx = match get_global_context() {
+        Ok(c) => c,
+        Err(e) => {
+            store_error(format!("CUDA context init failed: {}", e));
+            return ERR_CUDA;
+        }
+    };
+
+    // Pick any single prime — kernel work is the same per prime; we just
+    // need a valid P. Prefer one chosen by the same heuristic the production
+    // path uses, so timing reflects what users actually see.
+    let needed = match bound.checked_mul(2).and_then(|x| x.checked_add(1)) {
+        Some(v) => v,
+        None => {
+            store_error("count_upper_bound too large for u64 fast-path");
+            return ERR_BOUND_TOO_LARGE;
+        }
+    };
+    let prime_indices = match choose_primes_u64(needed) {
+        Some((idx, _)) => idx,
+        None => {
+            store_error("count_upper_bound exceeds u63 envelope");
+            return ERR_BOUND_TOO_LARGE;
+        }
+    };
+    let p = CRT_PRIMES[prime_indices[0]];
+
+    let a_slice = unsafe { std::slice::from_raw_parts(a, m * k) };
+    let b_slice = unsafe { std::slice::from_raw_parts(b, k * n) };
+
+    // Same layout choice as the production driver (Spec H).
+    let use_warpk = k >= COUNTING_WARPK_K_THRESHOLD
+        && m.saturating_mul(n) <= COUNTING_WARPK_MN_CEILING;
+
+    let result: Result<f64, CudaError> = (|| {
+        let value_a_dev = GpuMatrix::<T>::from_host(ctx, a_slice, m, k)?;
+        let value_b_dev = if use_warpk {
+            // Host transpose K×N → N×K row-major.
+            let mut b_t: Vec<T> = vec![T::default(); n * k];
+            for kv in 0..k {
+                for j in 0..n {
+                    b_t[j * k + kv] = b_slice[kv * n + j];
+                }
+            }
+            GpuMatrix::<T>::from_host(ctx, &b_t, n, k)?
+        } else {
+            GpuMatrix::<T>::from_host(ctx, b_slice, k, n)?
+        };
+
+        let mut value_c = GpuMatrix::<T>::alloc(ctx, m, n)?;
+        let mut count_c = GpuMatrix::<i32>::alloc(ctx, m, n)?;
+
+        // Warmup launch (also pays NVRTC cost on first call).
+        launch_counting_gemm_ones::<T, D>(
+            ctx,
+            &value_a_dev,
+            &value_b_dev,
+            &mut value_c,
+            &mut count_c,
+            m, k, n,
+            p,
+        )?;
+
+        // Timed loop. launch_counting_gemm_ones synchronizes after each
+        // launch, so wall time wraps the kernel + sync per iter.
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            launch_counting_gemm_ones::<T, D>(
+                ctx,
+                &value_a_dev,
+                &value_b_dev,
+                &mut value_c,
+                &mut count_c,
+                m, k, n,
+                p,
+            )?;
+        }
+        let avg_ms = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+        Ok(avg_ms)
+    })();
+
+    match result {
+        Ok(avg_ms) => {
+            unsafe { *out_avg_ms = avg_ms };
+            OK
+        }
+        Err(e) => {
+            store_error(format!("{}", e));
+            ERR_CUDA
+        }
+    }
+}
+
+macro_rules! cabi_bench_kernel_only {
+    ($name:ident, $T:ty, $D:ty) => {
+        #[no_mangle]
+        pub extern "C" fn $name(
+            a: *const $T,
+            m: usize,
+            k: usize,
+            b: *const $T,
+            n: usize,
+            bound: u64,
+            iters: u32,
+            out_avg_ms: *mut f64,
+        ) -> c_int {
+            let res = catch_unwind(AssertUnwindSafe(|| {
+                bench_kernel_only_impl::<$T, $D>(a, m, k, b, n, bound, iters, out_avg_ms)
+            }));
+            match res {
+                Ok(code) => code,
+                Err(_) => {
+                    store_error("Rust panic across FFI boundary");
+                    ERR_INTERNAL
+                }
+            }
+        }
+    };
+}
+
+cabi_bench_kernel_only!(tg_bench_kernel_only_u64_f32_max, f32, Max);
+cabi_bench_kernel_only!(tg_bench_kernel_only_u64_f32_min, f32, Min);
+cabi_bench_kernel_only!(tg_bench_kernel_only_u64_f64_max, f64, Max);
+cabi_bench_kernel_only!(tg_bench_kernel_only_u64_f64_min, f64, Min);
 
 #[cfg(test)]
 mod tests {

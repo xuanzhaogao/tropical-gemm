@@ -25,7 +25,7 @@ module CountingTropicalGEMM
 using Libdl
 
 export Max, Min, CountedMatU64
-export count_ground_states_gpu_u64
+export count_ground_states_gpu_u64, bench_kernel_only_u64
 export CountingTropicalGEMMError, BoundTooLargeError
 
 # ---------------------------------------------------------------------------
@@ -205,6 +205,51 @@ for (T, sym_max, sym_min) in (
             end
             CountedMatU64{$T}(_from_rowmajor(out_v, m, n),
                               _from_rowmajor(out_c, m, n))
+        end
+    end
+end
+
+"""
+    bench_kernel_only_u64(dir, A, B, bound; iters=10) -> avg_ms::Float64
+
+Time the counting kernel itself: upload `A` and `B` once, run the kernel
+`iters` times, return average per-launch wall time in milliseconds.
+Bypasses CRT combine and u64 reconstruction. Use this to measure the
+kernel's intrinsic GPU speed without wrapper overhead.
+"""
+function bench_kernel_only_u64 end
+
+for (T, sym_max, sym_min) in (
+    (Float32, :tg_bench_kernel_only_u64_f32_max, :tg_bench_kernel_only_u64_f32_min),
+    (Float64, :tg_bench_kernel_only_u64_f64_max, :tg_bench_kernel_only_u64_f64_min),
+)
+    for (dir, sym) in ((:Max, sym_max), (:Min, sym_min))
+        @eval function bench_kernel_only_u64(::Type{$dir},
+                                             A::Matrix{$T}, B::Matrix{$T},
+                                             bound::Unsigned;
+                                             iters::Integer = 10)::Float64
+            m, k = size(A); k2, n = size(B)
+            k == k2 || throw(DimensionMismatch(string(
+                "A is ", size(A), " but B is ", size(B), "; inner dims must match")))
+            iters > 0 || throw(ArgumentError("iters must be positive"))
+
+            # Inputs need to be in row-major byte order for the kernel; do
+            # the same boundary transpose as count_ground_states_gpu_u64.
+            a_rm = _rowmajor(A)
+            b_rm = _rowmajor(B)
+            avg = Ref{Float64}(0.0)
+
+            _check_version()
+            code = ccall(($(QuoteNode(sym)), _libpath()), Cint,
+                         (Ptr{$T}, Csize_t, Csize_t,
+                          Ptr{$T}, Csize_t,
+                          UInt64, UInt32, Ptr{Float64}),
+                         a_rm, m, k, b_rm, n,
+                         convert(UInt64, bound), convert(UInt32, iters), avg)
+            if code != Int32(0)
+                _throw_for(Int32(code))
+            end
+            avg[]
         end
     end
 end
