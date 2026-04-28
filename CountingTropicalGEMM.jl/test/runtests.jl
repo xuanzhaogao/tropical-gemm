@@ -223,4 +223,45 @@ end
         C = tropical_matmul_min(A, B)
         @test C == ref
     end
+
+    @testset "mul! over ModCountingTropical" begin
+        using LinearAlgebra
+        P = 7
+        Random.seed!(42)
+        A = [ModCountingTropical{Float32, P}(
+                Float32(rand(0:3)), Int32(rand(0:P-1))) for _ in 1:4, _ in 1:5]
+        B = [ModCountingTropical{Float32, P}(
+                Float32(rand(0:3)), Int32(rand(0:P-1))) for _ in 1:5, _ in 1:6]
+
+        # In-place vs functional must agree.
+        ref = tropical_matmul(A, B)
+        C = Matrix{ModCountingTropical{Float32, P}}(undef, 4, 6)
+        mul!(C, A, B)
+        @test C == ref
+
+        # Reuse the same C buffer with different inputs.
+        A2 = [ModCountingTropical{Float32, P}(
+                 Float32(rand(0:3)), Int32(rand(0:P-1))) for _ in 1:4, _ in 1:5]
+        ref2 = tropical_matmul(A2, B)
+        mul!(C, A2, B)
+        @test C == ref2
+
+        # Wrong-size C → DimensionMismatch.
+        Cbad = Matrix{ModCountingTropical{Float32, P}}(undef, 3, 6)  # rows wrong
+        @test_throws DimensionMismatch mul!(Cbad, A, B)
+    end
+
+    @testset "mul! over ModCountingTropicalMin" begin
+        using LinearAlgebra
+        P = 11
+        Random.seed!(43)
+        A = [ModCountingTropicalMin{Float64, P}(
+                Float64(rand(0:4)), Int32(rand(0:P-1))) for _ in 1:5, _ in 1:7]
+        B = [ModCountingTropicalMin{Float64, P}(
+                Float64(rand(0:4)), Int32(rand(0:P-1))) for _ in 1:7, _ in 1:4]
+        ref = tropical_matmul_min(A, B)
+        C = Matrix{ModCountingTropicalMin{Float64, P}}(undef, 5, 4)
+        mul!(C, A, B)
+        @test C == ref
+    end
 end

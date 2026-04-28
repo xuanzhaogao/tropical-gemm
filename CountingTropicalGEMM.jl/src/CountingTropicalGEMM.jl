@@ -23,6 +23,7 @@ res.counts  # 64×64 Matrix{UInt64} : count of ground states per cell
 module CountingTropicalGEMM
 
 using Libdl
+using LinearAlgebra
 
 export Max, Min, CountedMatU64, TropicalMatrix
 export count_ground_states_gpu_u64, bench_kernel_only_u64
@@ -598,5 +599,38 @@ tropical_matmul_min(A::AbstractMatrix{ModCountingTropicalMin{T, P}},
                     B::AbstractMatrix{ModCountingTropicalMin{T, P}}
                    ) where {T <: Union{Float32, Float64}, P} =
     _tropical_matmul_core(ModCountingTropicalMin{T, P}, Val(:min), A, B)
+
+# ---------------------------------------------------------------------------
+# Spec K Task 8: LinearAlgebra.mul! overloads for both directions.
+# The underlying FFI does not yet support output-buffer reuse on the device
+# side, so we delegate to tropical_matmul / tropical_matmul_min and copy
+# the result into the caller-provided C. Saves a host-side allocation but
+# not a device-side one (true device-buffer reuse is a future optimization).
+# ---------------------------------------------------------------------------
+function LinearAlgebra.mul!(
+    C::AbstractMatrix{ModCountingTropical{T, P}},
+    A::AbstractMatrix{ModCountingTropical{T, P}},
+    B::AbstractMatrix{ModCountingTropical{T, P}},
+) where {T <: Union{Float32, Float64}, P}
+    expected = (size(A, 1), size(B, 2))
+    size(C) == expected || throw(DimensionMismatch(
+        "C is $(size(C)) but A*B would be $(expected)"))
+    R = tropical_matmul(A, B)
+    @inbounds copyto!(C, R)
+    return C
+end
+
+function LinearAlgebra.mul!(
+    C::AbstractMatrix{ModCountingTropicalMin{T, P}},
+    A::AbstractMatrix{ModCountingTropicalMin{T, P}},
+    B::AbstractMatrix{ModCountingTropicalMin{T, P}},
+) where {T <: Union{Float32, Float64}, P}
+    expected = (size(A, 1), size(B, 2))
+    size(C) == expected || throw(DimensionMismatch(
+        "C is $(size(C)) but A*B would be $(expected)"))
+    R = tropical_matmul_min(A, B)
+    @inbounds copyto!(C, R)
+    return C
+end
 
 end # module
