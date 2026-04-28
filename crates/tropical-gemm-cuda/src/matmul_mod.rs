@@ -224,4 +224,76 @@ mod tests {
         );
         assert!(err.is_err(), "p=1 must be rejected");
     }
+
+    // ---- Spec N: tile-edge and ragged-K correctness tests ----
+
+    #[allow(non_snake_case)]
+    fn cpu_ref_max_f32(
+        tA: char, tB: char, m: usize, k: usize, n: usize,
+        a: &[crate::pair::PairF32], b: &[crate::pair::PairF32], p: i32,
+    ) -> Vec<crate::pair::PairF32> {
+        let mut out = vec![crate::pair::PairF32::new(f32::NEG_INFINITY, 0); m * n];
+        let p_u = p as u64;
+        for j in 0..n {
+            for i in 0..m {
+                let mut acc_v = f32::NEG_INFINITY;
+                let mut acc_c: u64 = 0;
+                for kk in 0..k {
+                    let av = if tA == 'N' { a[i + kk * m] } else { a[kk + i * k] };
+                    let bv = if tB == 'N' { b[kk + j * k] } else { b[j + kk * n] };
+                    let pv = av.val + bv.val;
+                    let pc = ((av.cnt as u64) * (bv.cnt as u64)) % p_u;
+                    if pv > acc_v { acc_v = pv; acc_c = pc; }
+                    else if pv == acc_v { acc_c = (acc_c + pc) % p_u; }
+                }
+                out[i + j * m] = crate::pair::PairF32::new(acc_v, (acc_c % p_u) as i32);
+            }
+        }
+        out
+    }
+
+    fn rand_pairs_f32(n: usize, p: i32) -> Vec<crate::pair::PairF32> {
+        use rand::{rngs::StdRng, Rng, SeedableRng};
+        let mut rng = StdRng::seed_from_u64(42);
+        (0..n).map(|_| crate::pair::PairF32::new(
+            rng.gen_range(0.0..4.0),
+            rng.gen_range(1..p),
+        )).collect()
+    }
+
+    #[allow(non_snake_case)]
+    fn run_and_check_f32_max(tA: char, tB: char, m: usize, k: usize, n: usize, p: i32) {
+        use cudarc::driver::DevicePtr;
+        let ctx = crate::get_global_context().expect("CUDA ctx");
+        let a_len = m * k; let b_len = k * n;
+        let a_host = rand_pairs_f32(a_len, p);
+        let b_host = rand_pairs_f32(b_len, p);
+        let expect = cpu_ref_max_f32(tA, tB, m, k, n, &a_host, &b_host, p);
+        let a_dev = ctx.device().htod_copy(a_host).unwrap();
+        let b_dev = ctx.device().htod_copy(b_host).unwrap();
+        let out_dev = ctx.device().alloc_zeros::<crate::pair::PairF32>(m * n).unwrap();
+        crate::matmul_mod::tropical_matmul_kernel::<f32, tropical_gemm::types::Max>(
+            ctx, tA, tB, m, k, n,
+            *a_dev.device_ptr(), *b_dev.device_ptr(), p, *out_dev.device_ptr(),
+        ).unwrap();
+        let got = ctx.device().dtoh_sync_copy(&out_dev).unwrap();
+        for idx in 0..(m*n) {
+            assert_eq!(got[idx].val, expect[idx].val,
+                "val mismatch at {} (tA={},tB={},M={},K={},N={})", idx, tA, tB, m, k, n);
+            assert_eq!(got[idx].cnt, expect[idx].cnt,
+                "cnt mismatch at {} (tA={},tB={},M={},K={},N={})", idx, tA, tB, m, k, n);
+        }
+    }
+
+    #[test] fn tile_edge_nn_65_65_65_f32() { run_and_check_f32_max('N','N', 65, 65, 65, 7); }
+    #[test] fn tile_edge_tt_100_33_77_f32() { run_and_check_f32_max('T','T', 100, 33, 77, 11); }
+    #[test] fn tile_exact_nt_128_128_128_f32() { run_and_check_f32_max('N','T', 128, 128, 128, 13); }
+
+    #[test] fn ragged_k_bk_plus_1_nn_f32() { run_and_check_f32_max('N','N', 8, 9, 8, 7); }
+    #[test] fn ragged_k_bk_plus_1_nt_f32() { run_and_check_f32_max('N','T', 8, 9, 8, 7); }
+    #[test] fn ragged_k_bk_plus_1_tn_f32() { run_and_check_f32_max('T','N', 8, 9, 8, 7); }
+    #[test] fn ragged_k_bk_plus_1_tt_f32() { run_and_check_f32_max('T','T', 8, 9, 8, 7); }
+
+    #[test] fn ragged_k_2bk_minus_1_nn_f32() { run_and_check_f32_max('N','N', 8, 15, 8, 7); }
+    #[test] fn ragged_k_1_tt_f32() { run_and_check_f32_max('T','T', 8, 1, 8, 7); }
 }
