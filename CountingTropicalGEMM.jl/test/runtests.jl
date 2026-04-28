@@ -9,6 +9,7 @@ get!(ENV, "JULIA_CUDA_USE_COMPAT", "false")
 
 using Test
 using Random
+using CUDA
 using CountingTropicalGEMM
 
 # Reference implementation for cross-checking. Tropical max/min-plus matmul
@@ -423,5 +424,132 @@ end
 
         # Modulus validation.
         @test_throws ArgumentError tropical_matmul_dev(pa, 2, 2, pb, 2, 1)
+    end
+
+    @testset "Spec M tropical_matmul NN f32 Max" begin
+        P = 7
+        Random.seed!(101)
+        A_host = [ModCountingTropical{Float32, P}(
+                    Float32(rand(0:3)), Int32(rand(0:P-1))) for _ in 1:5, _ in 1:8]
+        B_host = [ModCountingTropical{Float32, P}(
+                    Float32(rand(0:3)), Int32(rand(0:P-1))) for _ in 1:8, _ in 1:6]
+        A = CuArray(A_host); B = CuArray(B_host)
+
+        ref = Matrix{ModCountingTropical{Float32, P}}(undef, 5, 6)
+        for i in 1:5, j in 1:6
+            best_n = -Inf32; best_c = Int32(0)
+            for kk in 1:8
+                v = A_host[i, kk].n + B_host[kk, j].n
+                c = Int32(mod(Int64(A_host[i, kk].c) * Int64(B_host[kk, j].c), Int64(P)))
+                if v > best_n
+                    best_n = v; best_c = c
+                elseif v == best_n
+                    best_c = Int32(mod(Int64(best_c) + Int64(c), Int64(P)))
+                end
+            end
+            ref[i, j] = ModCountingTropical{Float32, P}(best_n, best_c)
+        end
+
+        C_dev = tropical_matmul('N', 'N', A, B)
+        @test Array(C_dev) == ref
+    end
+
+    @testset "Spec M tropical_matmul TT f64 Min" begin
+        P = 11
+        Random.seed!(102)
+        A_host = [ModCountingTropicalMin{Float64, P}(
+                    Float64(rand(0:4)), Int32(rand(0:P-1))) for _ in 1:6, _ in 1:9]
+        B_host = [ModCountingTropicalMin{Float64, P}(
+                    Float64(rand(0:4)), Int32(rand(0:P-1))) for _ in 1:9, _ in 1:7]
+        # Build the transposed inputs A_T (Julia 9×6) and B_T (Julia 7×9).
+        AT_host = [A_host[i, j] for j in 1:9, i in 1:6]
+        BT_host = [B_host[i, j] for j in 1:7, i in 1:9]
+        AT = CuArray(AT_host); BT = CuArray(BT_host)
+
+        ref = Matrix{ModCountingTropicalMin{Float64, P}}(undef, 6, 7)
+        for i in 1:6, j in 1:7
+            best_n = Inf; best_c = Int32(0)
+            for kk in 1:9
+                v = A_host[i, kk].n + B_host[kk, j].n
+                c = Int32(mod(Int64(A_host[i, kk].c) * Int64(B_host[kk, j].c), Int64(P)))
+                if v < best_n
+                    best_n = v; best_c = c
+                elseif v == best_n
+                    best_c = Int32(mod(Int64(best_c) + Int64(c), Int64(P)))
+                end
+            end
+            ref[i, j] = ModCountingTropicalMin{Float64, P}(best_n, best_c)
+        end
+
+        C_dev = tropical_matmul('T', 'T', AT, BT)
+        @test Array(C_dev) == ref
+    end
+
+    @testset "Spec M tropical_matmul NT, TN f32 Max" begin
+        P = 13
+        Random.seed!(103)
+        A_host = [ModCountingTropical{Float32, P}(
+                    Float32(rand(0:3)), Int32(rand(0:P-1))) for _ in 1:4, _ in 1:5]
+        B_host = [ModCountingTropical{Float32, P}(
+                    Float32(rand(0:3)), Int32(rand(0:P-1))) for _ in 1:5, _ in 1:6]
+
+        ref = Matrix{ModCountingTropical{Float32, P}}(undef, 4, 6)
+        for i in 1:4, j in 1:6
+            best_n = -Inf32; best_c = Int32(0)
+            for kk in 1:5
+                v = A_host[i, kk].n + B_host[kk, j].n
+                c = Int32(mod(Int64(A_host[i, kk].c) * Int64(B_host[kk, j].c), Int64(P)))
+                if v > best_n
+                    best_n = v; best_c = c
+                elseif v == best_n
+                    best_c = Int32(mod(Int64(best_c) + Int64(c), Int64(P)))
+                end
+            end
+            ref[i, j] = ModCountingTropical{Float32, P}(best_n, best_c)
+        end
+
+        # NT path: A as 'N', B^T as 'T'.
+        BT_host = [B_host[i, j] for j in 1:6, i in 1:5]
+        A = CuArray(A_host); BT = CuArray(BT_host)
+        C_NT = tropical_matmul('N', 'T', A, BT)
+        @test Array(C_NT) == ref
+
+        # TN path: A^T as 'T', B as 'N'.
+        AT_host = [A_host[i, j] for j in 1:5, i in 1:4]
+        AT = CuArray(AT_host); B = CuArray(B_host)
+        C_TN = tropical_matmul('T', 'N', AT, B)
+        @test Array(C_TN) == ref
+    end
+
+    @testset "Spec M tropical_matmul! reuse" begin
+        P = 7
+        Random.seed!(104)
+        A_host = [ModCountingTropical{Float32, P}(
+                    Float32(rand(0:3)), Int32(rand(0:P-1))) for _ in 1:4, _ in 1:5]
+        B_host = [ModCountingTropical{Float32, P}(
+                    Float32(rand(0:3)), Int32(rand(0:P-1))) for _ in 1:5, _ in 1:6]
+        A = CuArray(A_host); B = CuArray(B_host)
+        C = CuArray{ModCountingTropical{Float32, P}}(undef, 4, 6)
+        ref = Array(tropical_matmul('N', 'N', A, B))
+        tropical_matmul!('N', 'N', A, B, C)
+        @test Array(C) == ref
+    end
+
+    @testset "Spec M tropical_matmul errors" begin
+        P = 7
+        A = CuArray([ModCountingTropical{Float32, P}(0.0f0, Int32(1)) for _ in 1:2, _ in 1:3])
+        B = CuArray([ModCountingTropical{Float32, P}(0.0f0, Int32(1)) for _ in 1:3, _ in 1:4])
+        Bbad = CuArray([ModCountingTropical{Float32, P}(0.0f0, Int32(1)) for _ in 1:5, _ in 1:4])
+
+        @test_throws ArgumentError tropical_matmul('X', 'N', A, B)
+        @test_throws ArgumentError tropical_matmul('N', 'C', A, B)
+
+        Aone = CuArray([ModCountingTropical{Float32, 1}(0.0f0, Int32(0)) for _ in 1:2, _ in 1:2])
+        @test_throws ArgumentError tropical_matmul('N', 'N', Aone, Aone)
+
+        @test_throws DimensionMismatch tropical_matmul('N', 'N', A, Bbad)
+
+        Bmin = CuArray([ModCountingTropicalMin{Float32, P}(0.0f0, Int32(1)) for _ in 1:3, _ in 1:4])
+        @test_throws MethodError tropical_matmul('N', 'N', A, Bmin)
     end
 end

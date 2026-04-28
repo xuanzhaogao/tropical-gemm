@@ -30,7 +30,7 @@ export Max, Min, CountedMatU64, TropicalMatrix
 export count_ground_states_gpu_u64, bench_kernel_only_u64
 export CountingTropicalGEMMError, BoundTooLargeError
 export ModCountingTropical, ModCountingTropicalMin
-export tropical_matmul, tropical_matmul_min
+export tropical_matmul, tropical_matmul!, tropical_matmul_min
 export tropical_matmul_dev, tropical_matmul_dev_min, cuda_pair_buffer
 
 # ---------------------------------------------------------------------------
@@ -809,5 +809,137 @@ tropical_matmul_dev_min(pair_a::CuVector{PairF32}, m::Integer, k::Integer,
 tropical_matmul_dev_min(pair_a::CuVector{PairF64}, m::Integer, k::Integer,
                         pair_b::CuVector{PairF64}, n::Integer, p::Integer) =
     _tropical_matmul_dev_core(Float64, PairF64, Val(:min), pair_a, m, k, pair_b, n, p)
+
+# ---------------------------------------------------------------------------
+# Spec M: column-major BLAS-style mod-P counting tropical GEMM.
+# Inputs and output are device-resident CuMatrix; element type encodes
+# direction (ModCountingTropical = max-plus, ModCountingTropicalMin = min-plus)
+# and modulus P.
+# ---------------------------------------------------------------------------
+
+# Per-(T, dir) ccall thunks. Each takes (tA, tB, M, K, N, a_dev, b_dev, p, out_dev).
+for (T, sym_max, sym_min) in (
+    (Float32, :tg_tropical_matmul_f32_max, :tg_tropical_matmul_f32_min),
+    (Float64, :tg_tropical_matmul_f64_max, :tg_tropical_matmul_f64_min),
+)
+    for (dir_sym, sym) in ((:max, sym_max), (:min, sym_min))
+        thunk = Symbol("_spec_m_thunk_", T, "_", dir_sym)
+        @eval function $thunk(tA::Cchar, tB::Cchar,
+                              m::Csize_t, k::Csize_t, n::Csize_t,
+                              a_dev::UInt64, b_dev::UInt64,
+                              p::Int32,
+                              out_dev::UInt64)
+            _check_version()
+            code = ccall(($(QuoteNode(sym)), _libpath()), Cint,
+                (Cchar, Cchar, Csize_t, Csize_t, Csize_t, UInt64, UInt64, Int32, UInt64),
+                tA, tB, m, k, n, a_dev, b_dev, p, out_dev)
+            if code != Int32(0)
+                _throw_for(Int32(code))
+            end
+            return nothing
+        end
+    end
+end
+
+@inline function _spec_m_validate_flag(flag::Char)
+    flag == 'N' || flag == 'T' || throw(ArgumentError(
+        "tA/tB must be 'N' or 'T', got $(flag)"))
+end
+
+@inline function _spec_m_validate_p(P::Integer)
+    2 <= P < (Int64(1) << 31) || throw(ArgumentError(
+        "modulus P must satisfy 2 <= P < 2^31, got $P"))
+end
+
+@inline function _spec_m_logical_dims(tA::Char, tB::Char, sA::NTuple{2,Int}, sB::NTuple{2,Int})
+    rA, cA = sA; rB, cB = sB
+    M = (tA == 'N') ? rA : cA
+    Kused = (tA == 'N') ? cA : rA
+    Kchk = (tB == 'N') ? rB : cB
+    N = (tB == 'N') ? cB : rB
+    Kused == Kchk || throw(DimensionMismatch(
+        "inner K mismatch: op($tA, A) gives K=$Kused, op($tB, B) gives K=$Kchk"))
+    return M, Kused, N
+end
+
+@inline _spec_m_u64ptr(A::CuArray) = UInt64(UInt(pointer(A)))
+
+# Internal: dispatch to the right (T, dir) thunk.
+function _spec_m_call(::Type{T}, ::Val{dir}, tA::Char, tB::Char,
+                      M::Int, K::Int, N::Int, P::Integer,
+                      a_ptr::UInt64, b_ptr::UInt64, out_ptr::UInt64
+                     ) where {T, dir}
+    if T === Float32 && dir === :max
+        _spec_m_thunk_Float32_max(Cchar(tA), Cchar(tB),
+            Csize_t(M), Csize_t(K), Csize_t(N), a_ptr, b_ptr, Int32(P), out_ptr)
+    elseif T === Float32 && dir === :min
+        _spec_m_thunk_Float32_min(Cchar(tA), Cchar(tB),
+            Csize_t(M), Csize_t(K), Csize_t(N), a_ptr, b_ptr, Int32(P), out_ptr)
+    elseif T === Float64 && dir === :max
+        _spec_m_thunk_Float64_max(Cchar(tA), Cchar(tB),
+            Csize_t(M), Csize_t(K), Csize_t(N), a_ptr, b_ptr, Int32(P), out_ptr)
+    elseif T === Float64 && dir === :min
+        _spec_m_thunk_Float64_min(Cchar(tA), Cchar(tB),
+            Csize_t(M), Csize_t(K), Csize_t(N), a_ptr, b_ptr, Int32(P), out_ptr)
+    else
+        error("unreachable: T=$T, dir=$dir")
+    end
+end
+
+# Public: max-plus on CuMatrix{ModCountingTropical{T, P}}.
+function tropical_matmul(tA::Char, tB::Char,
+                         A::CuMatrix{ModCountingTropical{T, P}},
+                         B::CuMatrix{ModCountingTropical{T, P}}
+                        ) where {T <: Union{Float32, Float64}, P}
+    _spec_m_validate_flag(tA); _spec_m_validate_flag(tB); _spec_m_validate_p(P)
+    M, K, N = _spec_m_logical_dims(tA, tB, size(A), size(B))
+    out = CuArray{ModCountingTropical{T, P}}(undef, M, N)
+    _spec_m_call(T, Val(:max), tA, tB, M, K, N, P,
+                 _spec_m_u64ptr(A), _spec_m_u64ptr(B), _spec_m_u64ptr(out))
+    return out
+end
+
+# Public: min-plus on CuMatrix{ModCountingTropicalMin{T, P}}.
+function tropical_matmul(tA::Char, tB::Char,
+                         A::CuMatrix{ModCountingTropicalMin{T, P}},
+                         B::CuMatrix{ModCountingTropicalMin{T, P}}
+                        ) where {T <: Union{Float32, Float64}, P}
+    _spec_m_validate_flag(tA); _spec_m_validate_flag(tB); _spec_m_validate_p(P)
+    M, K, N = _spec_m_logical_dims(tA, tB, size(A), size(B))
+    out = CuArray{ModCountingTropicalMin{T, P}}(undef, M, N)
+    _spec_m_call(T, Val(:min), tA, tB, M, K, N, P,
+                 _spec_m_u64ptr(A), _spec_m_u64ptr(B), _spec_m_u64ptr(out))
+    return out
+end
+
+# Public: in-place tropical_matmul! (max-plus).
+function tropical_matmul!(tA::Char, tB::Char,
+                          A::CuMatrix{ModCountingTropical{T, P}},
+                          B::CuMatrix{ModCountingTropical{T, P}},
+                          C::CuMatrix{ModCountingTropical{T, P}}
+                         ) where {T <: Union{Float32, Float64}, P}
+    _spec_m_validate_flag(tA); _spec_m_validate_flag(tB); _spec_m_validate_p(P)
+    M, K, N = _spec_m_logical_dims(tA, tB, size(A), size(B))
+    size(C) == (M, N) || throw(DimensionMismatch(
+        "C is $(size(C)) but op($tA,A)*op($tB,B) is $((M, N))"))
+    _spec_m_call(T, Val(:max), tA, tB, M, K, N, P,
+                 _spec_m_u64ptr(A), _spec_m_u64ptr(B), _spec_m_u64ptr(C))
+    return C
+end
+
+# Public: in-place tropical_matmul! (min-plus).
+function tropical_matmul!(tA::Char, tB::Char,
+                          A::CuMatrix{ModCountingTropicalMin{T, P}},
+                          B::CuMatrix{ModCountingTropicalMin{T, P}},
+                          C::CuMatrix{ModCountingTropicalMin{T, P}}
+                         ) where {T <: Union{Float32, Float64}, P}
+    _spec_m_validate_flag(tA); _spec_m_validate_flag(tB); _spec_m_validate_p(P)
+    M, K, N = _spec_m_logical_dims(tA, tB, size(A), size(B))
+    size(C) == (M, N) || throw(DimensionMismatch(
+        "C is $(size(C)) but op($tA,A)*op($tB,B) is $((M, N))"))
+    _spec_m_call(T, Val(:min), tA, tB, M, K, N, P,
+                 _spec_m_u64ptr(A), _spec_m_u64ptr(B), _spec_m_u64ptr(C))
+    return C
+end
 
 end # module
