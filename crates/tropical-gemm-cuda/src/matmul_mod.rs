@@ -48,7 +48,7 @@ where
     (T, D): CountingCudaKernel<T, D>,
 {
     // Validate P range.
-    if p < P_MIN || p < 0 {
+    if p < P_MIN {
         return Err(CudaError::InvalidState(format!(
             "modulus must satisfy {} <= p < 2^31, got {}",
             P_MIN, p
@@ -137,5 +137,48 @@ mod tests {
 
         assert_eq!(out_val, vec![9.0_f32, 10.0, 11.0, 12.0]);
         assert_eq!(out_cnt, vec![1_i32, 1, 1, 1]);
+    }
+
+    #[test]
+    fn matmul_mod_p_observable_reduction() {
+        // Construct an all-tie matmul where each output cell sums K input
+        // count products. Pick K=5, all values = 0.0, all input counts = 2,
+        // P = 3. Each cell: sum of 5 ties, each 2*2 = 4. Total = 20.
+        // 20 mod 3 = 2. So output count should be 2 everywhere.
+        let ctx = crate::get_global_context().expect("CUDA ctx");
+        let m = 3usize; let k = 5usize; let n = 4usize;
+        let a_val = vec![0.0_f32; m * k];
+        let a_cnt = vec![2_i32; m * k];
+        let b_val = vec![0.0_f32; k * n];
+        let b_cnt = vec![2_i32; k * n];
+        let mut out_val = vec![1.0_f32; m * n];  // sentinel
+        let mut out_cnt = vec![99_i32; m * n];   // sentinel
+
+        matmul_mod_p::<f32, Max>(
+            ctx, &a_val, &a_cnt, m, k, &b_val, &b_cnt, n, 3,
+            &mut out_val, &mut out_cnt,
+        ).expect("driver ok");
+
+        assert!(out_val.iter().all(|&v| v == 0.0_f32));
+        // 20 mod 3 = 2 — verifies the modulus actually threads through.
+        assert!(out_cnt.iter().all(|&c| c == 2_i32),
+            "expected all counts = 2, got {:?}", out_cnt);
+    }
+
+    #[test]
+    fn matmul_mod_p_rejects_p_one() {
+        let ctx = crate::get_global_context().expect("CUDA ctx");
+        let a_val = vec![1.0_f32; 4]; let a_cnt = vec![1_i32; 4];
+        let b_val = vec![1.0_f32; 4]; let b_cnt = vec![1_i32; 4];
+        let mut out_val = vec![0.0_f32; 4];
+        let mut out_cnt = vec![0_i32; 4];
+
+        let err = matmul_mod_p::<f32, Max>(
+            ctx, &a_val, &a_cnt, 2, 2, &b_val, &b_cnt, 2, 1,
+            &mut out_val, &mut out_cnt,
+        ).expect_err("p=1 must be rejected");
+        let msg = format!("{}", err);
+        assert!(msg.contains("modulus") || msg.contains("p"),
+            "expected modulus error, got: {}", msg);
     }
 }
