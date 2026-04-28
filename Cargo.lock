@@ -382,6 +382,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "num-bigint"
+version = "0.4.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a5e44f723f1133c9deac646763579fdb3ac745e418f2a7af9cd0c431da1f20b9"
+dependencies = [
+ "num-integer",
+ "num-traits",
+]
+
+[[package]]
 name = "num-complex"
 version = "0.4.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -855,6 +865,8 @@ name = "tropical-gemm"
 version = "0.2.0"
 dependencies = [
  "criterion",
+ "num-bigint",
+ "num-integer",
  "num-traits",
  "proptest",
  "rayon",
@@ -867,6 +879,9 @@ version = "0.2.0"
 dependencies = [
  "criterion",
  "cudarc",
+ "num-bigint",
+ "num-integer",
+ "num-traits",
  "once_cell",
  "thiserror",
  "tropical-gemm",
@@ -877,6 +892,7 @@ name = "tropical-gemm-python"
 version = "0.2.0"
 dependencies = [
  "dlpark",
+ "num-bigint",
  "numpy",
  "pyo3",
  "tropical-gemm",

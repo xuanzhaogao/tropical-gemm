@@ -122,6 +122,12 @@ impl<T: TropicalScalar> From<T> for TropicalMaxPlus<T> {
     }
 }
 
+// Safety: TropicalMaxPlus<T> is #[repr(transparent)] over T.
+unsafe impl<T: TropicalScalar> crate::types::traits::ReprTransparentTropical
+    for TropicalMaxPlus<T>
+{
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

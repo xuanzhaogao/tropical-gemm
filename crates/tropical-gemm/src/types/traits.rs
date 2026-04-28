@@ -59,3 +59,16 @@ pub trait SimdTropical: TropicalSemiring {
     /// The SIMD width in elements.
     const SIMD_WIDTH: usize;
 }
+
+/// Marker trait: `Self` has identical memory layout to `Self::Scalar`.
+///
+/// # Safety
+///
+/// Implementors must be `#[repr(transparent)]` newtype wrappers over
+/// exactly one field of type `Self::Scalar`. This allows safe
+/// reinterpretation of `&[Self::Scalar]` as `&[Self]` and vice versa
+/// via pointer casts.
+///
+/// Compound-element semirings (e.g. `CountingTropical`, which has two
+/// fields) must NOT implement this trait.
+pub unsafe trait ReprTransparentTropical: TropicalSemiring {}

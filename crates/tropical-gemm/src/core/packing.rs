@@ -1,4 +1,3 @@
-use crate::types::TropicalScalar;
 
 /// Matrix layout enumeration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,7 +42,7 @@ pub enum Transpose {
 /// # Safety
 /// - `a` must point to valid memory for at least `m * lda` elements
 /// - `packed` must have capacity for at least `((m + mr - 1) / mr) * mr * k` elements
-pub unsafe fn pack_a<T: TropicalScalar>(
+pub unsafe fn pack_a<T: Copy + Default>(
     m: usize,
     k: usize,
     a: *const T,
@@ -53,7 +52,7 @@ pub unsafe fn pack_a<T: TropicalScalar>(
     packed: *mut T,
     mr: usize,
 ) {
-    let zero = T::scalar_zero();
+    let zero = T::default();
 
     let mut packed_idx = 0;
 
@@ -112,7 +111,7 @@ pub unsafe fn pack_a<T: TropicalScalar>(
 /// # Safety
 /// - `b` must point to valid memory for at least `k * ldb` or `ldb * n` elements
 /// - `packed` must have capacity for at least `((n + nr - 1) / nr) * nr * k` elements
-pub unsafe fn pack_b<T: TropicalScalar>(
+pub unsafe fn pack_b<T: Copy + Default>(
     k: usize,
     n: usize,
     b: *const T,
@@ -122,7 +121,7 @@ pub unsafe fn pack_b<T: TropicalScalar>(
     packed: *mut T,
     nr: usize,
 ) {
-    let zero = T::scalar_zero();
+    let zero = T::default();
 
     let mut packed_idx = 0;
 

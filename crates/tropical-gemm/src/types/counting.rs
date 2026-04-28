@@ -1,16 +1,22 @@
+use super::direction::{Max, TropicalDirection};
 use super::scalar::TropicalScalar;
 use super::traits::{SimdTropical, TropicalSemiring, TropicalWithArgmax};
 use std::fmt;
+use std::marker::PhantomData;
 use std::ops::{Add, Mul};
 
 /// CountingTropical semiring: tracks both the tropical value and the count of optimal paths.
 ///
-/// For TropicalMaxPlus semantics:
+/// For TropicalMaxPlus semantics (D = Max, the default):
 /// - Multiplication: (n₁, c₁) ⊗ (n₂, c₂) = (n₁ + n₂, c₁ × c₂)
 /// - Addition: (n₁, c₁) ⊕ (n₂, c₂) =
 ///   - if n₁ > n₂: (n₁, c₁)
 ///   - if n₁ < n₂: (n₂, c₂)
 ///   - if n₁ = n₂: (n₁, c₁ + c₂)
+///
+/// For TropicalMinPlus semantics (D = Min):
+/// - Same multiplication.
+/// - Addition prefers the *smaller* value; ties still merge counts.
 ///
 /// This is used for:
 /// - Counting optimal paths in dynamic programming
@@ -18,18 +24,23 @@ use std::ops::{Add, Mul};
 /// - Gradient computations in certain neural network architectures
 #[derive(Copy, Clone, PartialEq)]
 #[repr(C)]
-pub struct CountingTropical<T: TropicalScalar, C: TropicalScalar = T> {
-    /// The tropical value (using MaxPlus semantics).
+pub struct CountingTropical<
+    T: TropicalScalar,
+    C: TropicalScalar = T,
+    D: TropicalDirection = Max,
+> {
+    /// The tropical value.
     pub value: T,
     /// The count of paths achieving this value.
     pub count: C,
+    _dir: PhantomData<D>,
 }
 
-impl<T: TropicalScalar, C: TropicalScalar> CountingTropical<T, C> {
+impl<T: TropicalScalar, C: TropicalScalar, D: TropicalDirection> CountingTropical<T, C, D> {
     /// Create a new CountingTropical value.
     #[inline(always)]
     pub fn new(value: T, count: C) -> Self {
-        Self { value, count }
+        Self { value, count, _dir: PhantomData }
     }
 
     /// Create a CountingTropical from a single value with count 1.
@@ -38,18 +49,22 @@ impl<T: TropicalScalar, C: TropicalScalar> CountingTropical<T, C> {
         Self {
             value,
             count: C::scalar_one(),
+            _dir: PhantomData,
         }
     }
 }
 
-impl<T: TropicalScalar, C: TropicalScalar> TropicalSemiring for CountingTropical<T, C> {
+impl<T: TropicalScalar, C: TropicalScalar, D: TropicalDirection> TropicalSemiring
+    for CountingTropical<T, C, D>
+{
     type Scalar = T;
 
     #[inline(always)]
     fn tropical_zero() -> Self {
         Self {
-            value: T::neg_infinity(),
+            value: D::zero_value::<T>(),
             count: C::scalar_zero(),
+            _dir: PhantomData,
         }
     }
 
@@ -58,20 +73,22 @@ impl<T: TropicalScalar, C: TropicalScalar> TropicalSemiring for CountingTropical
         Self {
             value: T::scalar_zero(),
             count: C::scalar_one(),
+            _dir: PhantomData,
         }
     }
 
     #[inline(always)]
     fn tropical_add(self, rhs: Self) -> Self {
-        if self.value > rhs.value {
+        if D::is_strictly_better(self.value, rhs.value) {
             self
-        } else if self.value < rhs.value {
+        } else if D::is_strictly_better(rhs.value, self.value) {
             rhs
         } else {
             // Equal values: add counts
             Self {
                 value: self.value,
                 count: self.count.scalar_add(rhs.count),
+                _dir: PhantomData,
             }
         }
     }
@@ -81,6 +98,7 @@ impl<T: TropicalScalar, C: TropicalScalar> TropicalSemiring for CountingTropical
         Self {
             value: self.value.scalar_add(rhs.value),
             count: self.count.scalar_mul(rhs.count),
+            _dir: PhantomData,
         }
     }
 
@@ -95,14 +113,16 @@ impl<T: TropicalScalar, C: TropicalScalar> TropicalSemiring for CountingTropical
     }
 }
 
-impl<T: TropicalScalar, C: TropicalScalar> TropicalWithArgmax for CountingTropical<T, C> {
+impl<T: TropicalScalar, C: TropicalScalar, D: TropicalDirection> TropicalWithArgmax
+    for CountingTropical<T, C, D>
+{
     type Index = u32;
 
     #[inline(always)]
     fn tropical_add_argmax(self, self_idx: u32, rhs: Self, rhs_idx: u32) -> (Self, u32) {
-        if self.value > rhs.value {
+        if D::is_strictly_better(self.value, rhs.value) {
             (self, self_idx)
-        } else if self.value < rhs.value {
+        } else if D::is_strictly_better(rhs.value, self.value) {
             (rhs, rhs_idx)
         } else {
             // Equal values: add counts, keep first index
@@ -110,6 +130,7 @@ impl<T: TropicalScalar, C: TropicalScalar> TropicalWithArgmax for CountingTropic
                 Self {
                     value: self.value,
                     count: self.count.scalar_add(rhs.count),
+                    _dir: PhantomData,
                 },
                 self_idx,
             )
@@ -117,13 +138,18 @@ impl<T: TropicalScalar, C: TropicalScalar> TropicalWithArgmax for CountingTropic
     }
 }
 
-impl<T: TropicalScalar, C: TropicalScalar> SimdTropical for CountingTropical<T, C> {
-    // SIMD for CountingTropical requires SOA layout
-    const SIMD_AVAILABLE: bool = true;
-    const SIMD_WIDTH: usize = 8;
+impl<T: TropicalScalar, C: TropicalScalar, D: TropicalDirection> SimdTropical
+    for CountingTropical<T, C, D>
+{
+    // No SIMD kernel exists for CountingTropical yet; claim will be revisited
+    // when an SoA-based vectorized path is added.
+    const SIMD_AVAILABLE: bool = false;
+    const SIMD_WIDTH: usize = 1;
 }
 
-impl<T: TropicalScalar, C: TropicalScalar> Add for CountingTropical<T, C> {
+impl<T: TropicalScalar, C: TropicalScalar, D: TropicalDirection> Add
+    for CountingTropical<T, C, D>
+{
     type Output = Self;
 
     #[inline(always)]
@@ -132,7 +158,9 @@ impl<T: TropicalScalar, C: TropicalScalar> Add for CountingTropical<T, C> {
     }
 }
 
-impl<T: TropicalScalar, C: TropicalScalar> Mul for CountingTropical<T, C> {
+impl<T: TropicalScalar, C: TropicalScalar, D: TropicalDirection> Mul
+    for CountingTropical<T, C, D>
+{
     type Output = Self;
 
     #[inline(always)]
@@ -141,26 +169,34 @@ impl<T: TropicalScalar, C: TropicalScalar> Mul for CountingTropical<T, C> {
     }
 }
 
-impl<T: TropicalScalar, C: TropicalScalar> Default for CountingTropical<T, C> {
+impl<T: TropicalScalar, C: TropicalScalar, D: TropicalDirection> Default
+    for CountingTropical<T, C, D>
+{
     #[inline(always)]
     fn default() -> Self {
         Self::tropical_zero()
     }
 }
 
-impl<T: TropicalScalar, C: TropicalScalar> fmt::Debug for CountingTropical<T, C> {
+impl<T: TropicalScalar, C: TropicalScalar, D: TropicalDirection> fmt::Debug
+    for CountingTropical<T, C, D>
+{
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "CountingTropical({}, {})", self.value, self.count)
     }
 }
 
-impl<T: TropicalScalar, C: TropicalScalar> fmt::Display for CountingTropical<T, C> {
+impl<T: TropicalScalar, C: TropicalScalar, D: TropicalDirection> fmt::Display
+    for CountingTropical<T, C, D>
+{
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "({}, {})", self.value, self.count)
     }
 }
 
-impl<T: TropicalScalar, C: TropicalScalar> From<T> for CountingTropical<T, C> {
+impl<T: TropicalScalar, C: TropicalScalar, D: TropicalDirection> From<T>
+    for CountingTropical<T, C, D>
+{
     #[inline(always)]
     fn from(value: T) -> Self {
         Self::from_value(value)
@@ -362,8 +398,8 @@ mod tests {
 
     #[test]
     fn test_simd_tropical() {
-        assert!(CountingTropical::<f64>::SIMD_AVAILABLE);
-        assert_eq!(CountingTropical::<f64>::SIMD_WIDTH, 8);
+        assert!(!CountingTropical::<f64>::SIMD_AVAILABLE);
+        assert_eq!(CountingTropical::<f64>::SIMD_WIDTH, 1);
     }
 
     #[test]
@@ -407,5 +443,33 @@ mod tests {
         let result = a.tropical_mul(b);
         assert_eq!(result.value, 8.0);
         assert!((result.count - 6.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn counting_min_prefers_smaller_value() {
+        use super::super::direction::Min;
+        let a = CountingTropical::<f64, f64, Min>::new(3.0, 2.0);
+        let b = CountingTropical::<f64, f64, Min>::new(5.0, 7.0);
+        let r = a.tropical_add(b);
+        assert_eq!(r.value, 3.0);
+        assert_eq!(r.count, 2.0);
+    }
+
+    #[test]
+    fn counting_min_merges_on_tie() {
+        use super::super::direction::Min;
+        let a = CountingTropical::<f64, f64, Min>::new(3.0, 2.0);
+        let b = CountingTropical::<f64, f64, Min>::new(3.0, 5.0);
+        let r = a.tropical_add(b);
+        assert_eq!(r.value, 3.0);
+        assert_eq!(r.count, 7.0);
+    }
+
+    #[test]
+    fn counting_min_zero_is_pos_infinity() {
+        use super::super::direction::Min;
+        let z = CountingTropical::<f64, f64, Min>::tropical_zero();
+        assert!(z.value.is_infinite() && z.value > 0.0);
+        assert_eq!(z.count, 0.0);
     }
 }

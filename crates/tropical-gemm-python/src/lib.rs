@@ -13,9 +13,11 @@ use pyo3::prelude::*;
 
 // Use fully qualified path to avoid naming conflict with the pymodule
 use ::tropical_gemm::{
-    tropical_matmul, tropical_matmul_with_argmax, GemmWithArgmax, TropicalMaxMul, TropicalMaxPlus,
-    TropicalMinPlus, TropicalSemiring,
+    bound_for_single_matmul, count_ground_states, tropical_matmul, tropical_matmul_with_argmax,
+    CountedMat, GemmWithArgmax, Max, Min, TropicalMaxMul, TropicalMaxPlus, TropicalMinPlus,
+    TropicalSemiring,
 };
+use num_bigint::BigInt;
 
 /// Tropical MaxPlus matrix multiplication: C[i,j] = max_k(A[i,k] + B[k,j])
 ///
@@ -2562,6 +2564,113 @@ mod gpu {
         Ok((c_capsule, argmax_capsule))
     }
 
+    /// Count ground-state configurations per cell of C = A · B on the GPU,
+    /// returning exact BigInt counts via CRT.
+    ///
+    /// Args:
+    ///     a: (m, k) float32 matrix.
+    ///     b: (k, n) float32 matrix.
+    ///     direction: 'max' or 'min'. Default 'min'.
+    ///     count_upper_bound: Caller-supplied upper bound on any per-cell count.
+    ///         If None, defaults to `bound_for_single_matmul(k)`.
+    ///
+    /// Returns:
+    ///     values: (m, n) float32 array of ground-state values.
+    ///     counts: (m, n) object array of Python int (unbounded).
+    #[pyfunction]
+    #[pyo3(signature = (a, b, direction="min", count_upper_bound=None))]
+    pub fn count_ground_states_gpu_py<'py>(
+        py: Python<'py>,
+        a: PyReadonlyArray2<'py, f32>,
+        b: PyReadonlyArray2<'py, f32>,
+        direction: &str,
+        count_upper_bound: Option<&Bound<'py, PyAny>>,
+    ) -> PyResult<(Bound<'py, PyArray2<f32>>, Bound<'py, PyArray2<PyObject>>)> {
+        use ::tropical_gemm::bound_for_single_matmul;
+        use tropical_gemm_cuda::{count_ground_states_gpu, CudaContext};
+
+        let a_shape = a.shape();
+        let b_shape = b.shape();
+        let m = a_shape[0];
+        let k = a_shape[1];
+        let k2 = b_shape[0];
+        let n = b_shape[1];
+        if k != k2 {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "Dimension mismatch: A is {}x{}, B is {}x{}",
+                m, k, k2, n
+            )));
+        }
+
+        // Resolve the bound on the GIL (needs Python object access).
+        let bound: num_bigint::BigInt = match count_upper_bound {
+            None => bound_for_single_matmul(k),
+            Some(obj) => {
+                let s: String = obj.call_method0("__str__")?.extract()?;
+                s.parse::<num_bigint::BigInt>().map_err(|e| {
+                    pyo3::exceptions::PyValueError::new_err(format!(
+                        "count_upper_bound must be a non-negative integer, got {:?} ({})",
+                        s, e
+                    ))
+                })?
+            }
+        };
+
+        // Copy input data so we can release the GIL for the heavy compute.
+        let a_data = a.as_slice()?.to_vec();
+        let b_data = b.as_slice()?.to_vec();
+
+        // Match on direction *before* allow_threads, then release the GIL.
+        let result = py
+            .allow_threads(|| -> Result<_, String> {
+                let ctx = CudaContext::new().map_err(|e| format!("CUDA init: {}", e))?;
+                match direction {
+                    "max" => count_ground_states_gpu::<f32, Max>(
+                        &ctx, &a_data, m, k, &b_data, n, &bound,
+                    )
+                    .map_err(|e| format!("GPU compute: {}", e)),
+                    "min" => count_ground_states_gpu::<f32, Min>(
+                        &ctx, &a_data, m, k, &b_data, n, &bound,
+                    )
+                    .map_err(|e| format!("GPU compute: {}", e)),
+                    other => Err(format!(
+                        "direction must be 'max' or 'min', got {:?}",
+                        other
+                    )),
+                }
+            })
+            .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+
+        // Values → (m, n) f32 array.
+        let values_array = numpy::ndarray::Array2::from_shape_vec((m, n), result.values)
+            .expect("values length matches m*n")
+            .into_pyarray(py);
+
+        // Counts → (m, n) object array of Python ints.
+        // Convert BigInt → Python int via decimal string representation.
+        let counts_py: Vec<PyObject> = result
+            .counts
+            .into_iter()
+            .map(|bn| {
+                let s = bn.to_string();
+                // Use Python's built-in int() on the decimal string.
+                py.eval(
+                    std::ffi::CString::new(format!("int({})", s))
+                        .unwrap()
+                        .as_c_str(),
+                    None,
+                    None,
+                )
+                .map(|b| b.unbind())
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        let counts_array = numpy::ndarray::Array2::from_shape_vec((m, n), counts_py)
+            .expect("counts length matches m*n")
+            .into_pyarray(py);
+
+        Ok((values_array, counts_array))
+    }
+
     /// Register GPU functions in the module.
     pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(maxplus_matmul_gpu, m)?)?;
@@ -2579,6 +2688,8 @@ mod gpu {
         m.add_function(wrap_pyfunction!(minplus_matmul_batched_dlpack, m)?)?;
         m.add_function(wrap_pyfunction!(maxmul_matmul_batched_dlpack, m)?)?;
         m.add_function(wrap_pyfunction!(cuda_available, m)?)?;
+        // Ground-state counting GPU
+        m.add_function(wrap_pyfunction!(count_ground_states_gpu_py, m)?)?;
         Ok(())
     }
 }
@@ -2598,6 +2709,107 @@ mod gpu {
         m.add_function(wrap_pyfunction!(cuda_available, m)?)?;
         Ok(())
     }
+}
+
+/// Count ground-state (or optimal) configurations per cell of `C = A · B`,
+/// returning exact BigInt counts via CRT.
+///
+/// Args:
+///     a: (m, k) float32 matrix.
+///     b: (k, n) float32 matrix.
+///     direction: 'max' or 'min'. Default 'min'.
+///     count_upper_bound: Caller-supplied upper bound on any per-cell count.
+///         If None, defaults to `bound_for_single_matmul(k)` (safe when both
+///         inputs have per-cell counts of 1, as this binding always does).
+///
+/// Returns:
+///     values: (m, n) float32 array of ground-state values.
+///     counts: (m, n) object array of Python int (unbounded).
+#[pyfunction]
+#[pyo3(signature = (a, b, direction="min", count_upper_bound=None))]
+fn count_ground_states_py<'py>(
+    py: Python<'py>,
+    a: PyReadonlyArray2<'py, f32>,
+    b: PyReadonlyArray2<'py, f32>,
+    direction: &str,
+    count_upper_bound: Option<&Bound<'py, PyAny>>,
+) -> PyResult<(Bound<'py, PyArray2<f32>>, Bound<'py, PyArray2<PyObject>>)> {
+    let a_shape = a.shape();
+    let b_shape = b.shape();
+    let m = a_shape[0];
+    let k = a_shape[1];
+    let k2 = b_shape[0];
+    let n = b_shape[1];
+    if k != k2 {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "Dimension mismatch: A is {}x{}, B is {}x{}",
+            m, k, k2, n
+        )));
+    }
+
+    // Resolve the bound on the GIL (needs Python object access).
+    let bound: BigInt = match count_upper_bound {
+        None => bound_for_single_matmul(k),
+        Some(obj) => {
+            let s: String = obj.call_method0("__str__")?.extract()?;
+            s.parse::<BigInt>().map_err(|e| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "count_upper_bound must be a non-negative integer, got {:?} ({})",
+                    s, e
+                ))
+            })?
+        }
+    };
+
+    // Copy input data so we can release the GIL for the heavy compute.
+    let a_data = a.as_slice()?.to_vec();
+    let b_data = b.as_slice()?.to_vec();
+
+    // Match on direction *before* allow_threads, so the generic dispatch
+    // happens once. The result type is the same for both arms.
+    let result: CountedMat<f32> = match direction {
+        "max" => py.allow_threads(|| {
+            count_ground_states::<f32, Max>(&a_data, m, k, &b_data, n, &bound)
+        }),
+        "min" => py.allow_threads(|| {
+            count_ground_states::<f32, Min>(&a_data, m, k, &b_data, n, &bound)
+        }),
+        other => {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "direction must be 'max' or 'min', got {:?}",
+                other
+            )));
+        }
+    };
+
+    // Values → (m, n) f32 array.
+    let values_array = Array2::from_shape_vec((m, n), result.values)
+        .expect("values length matches m*n")
+        .into_pyarray(py);
+
+    // Counts → (m, n) object array of Python ints.
+    // Convert BigInt → Python int via decimal string representation.
+    let counts_py: Vec<PyObject> = result
+        .counts
+        .into_iter()
+        .map(|bn| {
+            let s = bn.to_string();
+            // Use Python's built-in int() on the decimal string.
+            py.eval(
+                std::ffi::CString::new(format!("int({})", s))
+                    .unwrap()
+                    .as_c_str(),
+                None,
+                None,
+            )
+            .map(|b| b.unbind())
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    let counts_array = Array2::from_shape_vec((m, n), counts_py)
+        .expect("counts length matches m*n")
+        .into_pyarray(py);
+
+    Ok((values_array, counts_array))
 }
 
 /// Tropical GEMM Python module (native Rust extension).
@@ -2661,6 +2873,9 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(maxplus_matmul_2d_i64, m)?)?;
     m.add_function(wrap_pyfunction!(minplus_matmul_2d_i64, m)?)?;
     m.add_function(wrap_pyfunction!(maxmul_matmul_2d_i64, m)?)?;
+
+    // Ground-state counting (BigInt via CRT)
+    m.add_function(wrap_pyfunction!(count_ground_states_py, m)?)?;
 
     // GPU operations (if available)
     gpu::register(m)?;

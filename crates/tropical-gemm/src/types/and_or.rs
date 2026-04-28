@@ -125,6 +125,9 @@ impl From<bool> for TropicalAndOr {
     }
 }
 
+// Safety: TropicalAndOr is #[repr(transparent)] over bool.
+unsafe impl crate::types::traits::ReprTransparentTropical for TropicalAndOr {}
+
 #[cfg(test)]
 mod tests {
     use super::*;

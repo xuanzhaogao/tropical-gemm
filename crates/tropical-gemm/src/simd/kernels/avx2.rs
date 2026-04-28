@@ -1,5 +1,5 @@
 use crate::core::Microkernel;
-use crate::types::{TropicalMaxMul, TropicalMaxPlus, TropicalMinPlus};
+use crate::types::{ReprTransparentTropical, TropicalMaxMul, TropicalMaxPlus, TropicalMinPlus};
 use wide::{f32x8, f64x4};
 
 /// AVX2 microkernel for TropicalMaxPlus<f32>.
@@ -19,11 +19,15 @@ impl Microkernel<TropicalMaxPlus<f32>> for Avx2MaxPlusF32Kernel {
         mr: usize,
         nr: usize,
         k: usize,
-        a: *const f32,
-        b: *const f32,
+        a: *const TropicalMaxPlus<f32>,
+        b: *const TropicalMaxPlus<f32>,
         c: *mut TropicalMaxPlus<f32>,
         ldc: usize,
     ) {
+        // Safety: TropicalMaxPlus<f32> is repr(transparent) over f32
+        let a = a as *const f32;
+        let b = b as *const f32;
+
         // Initialize accumulators with -inf
         let neg_inf = f32x8::splat(f32::NEG_INFINITY);
         let mut acc = [neg_inf; 8];
@@ -87,11 +91,15 @@ impl Microkernel<TropicalMaxPlus<f64>> for Avx2MaxPlusF64Kernel {
         mr: usize,
         nr: usize,
         k: usize,
-        a: *const f64,
-        b: *const f64,
+        a: *const TropicalMaxPlus<f64>,
+        b: *const TropicalMaxPlus<f64>,
         c: *mut TropicalMaxPlus<f64>,
         ldc: usize,
     ) {
+        // Safety: TropicalMaxPlus<f64> is repr(transparent) over f64
+        let a = a as *const f64;
+        let b = b as *const f64;
+
         let neg_inf = f64x4::splat(f64::NEG_INFINITY);
         let mut acc = [neg_inf; 4];
 
@@ -148,11 +156,15 @@ impl Microkernel<TropicalMinPlus<f32>> for Avx2MinPlusF32Kernel {
         mr: usize,
         nr: usize,
         k: usize,
-        a: *const f32,
-        b: *const f32,
+        a: *const TropicalMinPlus<f32>,
+        b: *const TropicalMinPlus<f32>,
         c: *mut TropicalMinPlus<f32>,
         ldc: usize,
     ) {
+        // Safety: TropicalMinPlus<f32> is repr(transparent) over f32
+        let a = a as *const f32;
+        let b = b as *const f32;
+
         let pos_inf = f32x8::splat(f32::INFINITY);
         let mut acc = [pos_inf; 8];
 
@@ -210,11 +222,15 @@ impl Microkernel<TropicalMaxMul<f32>> for Avx2MaxMulF32Kernel {
         mr: usize,
         nr: usize,
         k: usize,
-        a: *const f32,
-        b: *const f32,
+        a: *const TropicalMaxMul<f32>,
+        b: *const TropicalMaxMul<f32>,
         c: *mut TropicalMaxMul<f32>,
         ldc: usize,
     ) {
+        // Safety: TropicalMaxMul<f32> is repr(transparent) over f32
+        let a = a as *const f32;
+        let b = b as *const f32;
+
         let zero = f32x8::splat(0.0);
         let mut acc = [zero; 8];
 
@@ -259,6 +275,11 @@ impl Microkernel<TropicalMaxMul<f32>> for Avx2MaxMulF32Kernel {
     }
 }
 
+// Suppress unused import warning - ReprTransparentTropical is used conceptually
+// by these impls which rely on the transparent layout guarantee
+#[allow(unused_imports)]
+use ReprTransparentTropical as _;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,18 +299,18 @@ mod tests {
         let k = 3;
 
         // A: 2x3 packed
-        let a: [f32; 24] = [
+        let a: [TropicalMaxPlus<f32>; 24] = [
             1.0, 4.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, // col 0
             2.0, 5.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, // col 1
             3.0, 6.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, // col 2
-        ];
+        ].map(TropicalMaxPlus);
 
         // B: 3x2 packed
-        let b: [f32; 24] = [
+        let b: [TropicalMaxPlus<f32>; 24] = [
             1.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, // row 0
             3.0, 4.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, // row 1
             5.0, 6.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, // row 2
-        ];
+        ].map(TropicalMaxPlus);
 
         let mut c = vec![TropicalMaxPlus::tropical_zero(); 4];
         let ldc = 2;
@@ -322,16 +343,16 @@ mod tests {
         let k = 3;
 
         // A: 2x3 packed
-        let a: [f32; 24] = [
+        let a: [TropicalMinPlus<f32>; 24] = [
             1.0, 4.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 2.0, 5.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0,
             6.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-        ];
+        ].map(TropicalMinPlus);
 
         // B: 3x2 packed
-        let b: [f32; 24] = [
+        let b: [TropicalMinPlus<f32>; 24] = [
             1.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 4.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 5.0,
             6.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-        ];
+        ].map(TropicalMinPlus);
 
         let mut c = vec![TropicalMinPlus::tropical_zero(); 4];
         let ldc = 2;
@@ -364,14 +385,14 @@ mod tests {
         let k = 2;
 
         // A: 2x2 packed
-        let a: [f32; 16] = [
+        let a: [TropicalMaxMul<f32>; 16] = [
             2.0, 3.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 4.0, 5.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-        ];
+        ].map(TropicalMaxMul);
 
         // B: 2x2 packed
-        let b: [f32; 16] = [
+        let b: [TropicalMaxMul<f32>; 16] = [
             1.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 4.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-        ];
+        ].map(TropicalMaxMul);
 
         let mut c = vec![TropicalMaxMul::tropical_zero(); 4];
         let ldc = 2;
@@ -404,16 +425,16 @@ mod tests {
         let k = 2;
 
         // A: 2x2 packed (4 f64 per column for mr=4 padding)
-        let a: [f64; 8] = [
+        let a: [TropicalMaxPlus<f64>; 8] = [
             1.0, 2.0, 0.0, 0.0, // col 0
             3.0, 4.0, 0.0, 0.0, // col 1
-        ];
+        ].map(TropicalMaxPlus);
 
         // B: 2x2 packed (4 f64 per row for nr=4 padding)
-        let b: [f64; 8] = [
+        let b: [TropicalMaxPlus<f64>; 8] = [
             1.0, 2.0, 0.0, 0.0, // row 0
             3.0, 4.0, 0.0, 0.0, // row 1
-        ];
+        ].map(TropicalMaxPlus);
 
         let mut c = vec![TropicalMaxPlus::tropical_zero(); 4];
         let ldc = 2;

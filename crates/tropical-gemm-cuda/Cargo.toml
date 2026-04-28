@@ -10,11 +10,17 @@ keywords = ["tropical", "cuda", "gpu", "matrix", "gemm"]
 categories = ["algorithms", "mathematics", "science"]
 readme = "../../README.md"
 
+[lib]
+crate-type = ["rlib", "cdylib"]
+
 [dependencies]
 tropical-gemm = { workspace = true }
 cudarc = { workspace = true }
 thiserror = { workspace = true }
 once_cell = "1.19"
+num-bigint = "0.4"
+num-integer = "0.1"
+num-traits = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

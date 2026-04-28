@@ -42,11 +42,15 @@
 //! global context that persists across calls. This avoids the ~7 second NVRTC
 //! compilation overhead on each call.
 
+pub mod c_api;
 mod context;
+pub(crate) mod counting_kernel;
+pub mod crt;
 mod error;
 mod gpu_mat;
 mod kernels;
 mod memory;
+pub mod pair;
 
 use cudarc::driver::CudaDevice;
 use once_cell::sync::OnceCell;
@@ -133,6 +137,7 @@ pub fn get_global_context() -> Result<&'static CudaContext> {
 }
 
 pub use context::CudaContext;
+pub use crt::{count_ground_states_gpu, count_ground_states_gpu_u64, CountedMatU64};
 pub use error::{CudaError, Result};
 pub use gpu_mat::{GpuMat, GpuMatWithArgmax};
 pub use kernels::{
@@ -143,6 +148,7 @@ pub use memory::{
     ArgmaxIndex, ExternalGpuMatrix, ExternalGpuMemory, ExternalGpuTensor3, GpuMatrix,
     GpuMatrixWithArgmax, GpuTensor3, GpuTensor3WithArgmax,
 };
+pub use tropical_gemm::CountedMat;
 
 use cudarc::driver::{DeviceRepr, ValidAsZeroBits};
 

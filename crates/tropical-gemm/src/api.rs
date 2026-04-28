@@ -1,6 +1,6 @@
 use crate::core::{GemmWithArgmax, Transpose};
 use crate::simd::{tropical_gemm_dispatch, KernelDispatch};
-use crate::types::{TropicalSemiring, TropicalWithArgmax};
+use crate::types::{ReprTransparentTropical, TropicalSemiring, TropicalWithArgmax};
 
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
@@ -30,11 +30,59 @@ use rayon::prelude::*;
 /// let c = tropical_matmul::<TropicalMaxPlus<f32>>(&a, 2, 3, &b, 2);
 /// assert_eq!(c.len(), 4); // 2x2 result
 /// ```
-pub fn tropical_matmul<T: TropicalSemiring + KernelDispatch>(
+pub fn tropical_matmul<T: TropicalSemiring + KernelDispatch + ReprTransparentTropical + Default>(
     a: &[T::Scalar],
     m: usize,
     k: usize,
     b: &[T::Scalar],
+    n: usize,
+) -> Vec<T> {
+    assert_eq!(a.len(), m * k, "A dimensions mismatch");
+    assert_eq!(b.len(), k * n, "B dimensions mismatch");
+
+    let mut c = vec![T::tropical_zero(); m * n];
+
+    unsafe {
+        // Safety: T: ReprTransparentTropical guarantees T is repr(transparent) over T::Scalar,
+        // so *const T::Scalar can be safely cast to *const T.
+        tropical_gemm_dispatch::<T>(
+            m,
+            n,
+            k,
+            a.as_ptr() as *const T,
+            k,
+            Transpose::NoTrans,
+            b.as_ptr() as *const T,
+            n,
+            Transpose::NoTrans,
+            c.as_mut_ptr(),
+            n,
+        );
+    }
+
+    c
+}
+
+/// Tropical matrix multiplication for compound element types: C = A ⊗ B
+///
+/// This variant accepts slices of the semiring type `T` directly,
+/// enabling use with compound elements like `CountingTropical` that
+/// cannot be safely cast from scalar slices.
+///
+/// # Arguments
+/// - `a`: Matrix A data in row-major order (elements of type `T`)
+/// - `m`: Number of rows in A
+/// - `k`: Number of columns in A / rows in B
+/// - `b`: Matrix B data in row-major order (elements of type `T`)
+/// - `n`: Number of columns in B
+///
+/// # Returns
+/// Result matrix C of size m×n in row-major order
+pub fn tropical_matmul_t<T: TropicalSemiring + KernelDispatch + Default>(
+    a: &[T],
+    m: usize,
+    k: usize,
+    b: &[T],
     n: usize,
 ) -> Vec<T> {
     assert_eq!(a.len(), m * k, "A dimensions mismatch");
@@ -78,7 +126,7 @@ pub fn tropical_matmul<T: TropicalSemiring + KernelDispatch>(
 /// assert_eq!(result.m, 2);
 /// assert_eq!(result.n, 2);
 /// ```
-pub fn tropical_matmul_with_argmax<T: TropicalWithArgmax<Index = u32> + KernelDispatch>(
+pub fn tropical_matmul_with_argmax<T: TropicalWithArgmax<Index = u32> + KernelDispatch + ReprTransparentTropical + Default>(
     a: &[T::Scalar],
     m: usize,
     k: usize,
@@ -91,14 +139,15 @@ pub fn tropical_matmul_with_argmax<T: TropicalWithArgmax<Index = u32> + KernelDi
     let mut result = GemmWithArgmax::new(m, n);
 
     unsafe {
+        // Safety: T: ReprTransparentTropical guarantees T is repr(transparent) over T::Scalar.
         crate::core::tropical_gemm_with_argmax_portable::<T>(
             m,
             n,
             k,
-            a.as_ptr(),
+            a.as_ptr() as *const T,
             k,
             Transpose::NoTrans,
-            b.as_ptr(),
+            b.as_ptr() as *const T,
             n,
             Transpose::NoTrans,
             &mut result,
@@ -134,7 +183,7 @@ pub struct TropicalGemm<T: TropicalSemiring> {
     _phantom: std::marker::PhantomData<T>,
 }
 
-impl<T: TropicalSemiring + KernelDispatch> TropicalGemm<T> {
+impl<T: TropicalSemiring + KernelDispatch + ReprTransparentTropical + Default> TropicalGemm<T> {
     /// Create a new GEMM builder.
     pub fn new(m: usize, n: usize, k: usize) -> Self {
         Self {
@@ -178,14 +227,15 @@ impl<T: TropicalSemiring + KernelDispatch> TropicalGemm<T> {
         ldc: usize,
     ) {
         unsafe {
+            // Safety: T: ReprTransparentTropical guarantees T is repr(transparent) over T::Scalar.
             tropical_gemm_dispatch::<T>(
                 self.m,
                 self.n,
                 self.k,
-                a.as_ptr(),
+                a.as_ptr() as *const T,
                 lda,
                 self.trans_a,
-                b.as_ptr(),
+                b.as_ptr() as *const T,
                 ldb,
                 self.trans_b,
                 c.as_mut_ptr(),
@@ -201,7 +251,7 @@ impl<T: TropicalSemiring + KernelDispatch> TropicalGemm<T> {
 ///
 /// # Safety
 /// All pointers must be valid for the specified dimensions.
-pub unsafe fn tropical_gemm<T: TropicalSemiring + KernelDispatch>(
+pub unsafe fn tropical_gemm<T: TropicalSemiring + KernelDispatch + ReprTransparentTropical + Default>(
     m: usize,
     n: usize,
     k: usize,
@@ -214,7 +264,8 @@ pub unsafe fn tropical_gemm<T: TropicalSemiring + KernelDispatch>(
     c: *mut T,
     ldc: usize,
 ) {
-    tropical_gemm_dispatch::<T>(m, n, k, a, lda, trans_a, b, ldb, trans_b, c, ldc);
+    // Safety: T: ReprTransparentTropical guarantees T is repr(transparent) over T::Scalar.
+    tropical_gemm_dispatch::<T>(m, n, k, a as *const T, lda, trans_a, b as *const T, ldb, trans_b, c, ldc);
 }
 
 /// Batched tropical matrix multiplication: C[i] = A[i] ⊗ B[i] for i = 0..batch_size
@@ -252,7 +303,7 @@ pub unsafe fn tropical_gemm<T: TropicalSemiring + KernelDispatch>(
 /// let c_batch = tropical_matmul_batched::<TropicalMaxPlus<f32>>(&a_batch, &b_batch, 2, 2, 2);
 /// assert_eq!(c_batch.len(), 2);
 /// ```
-pub fn tropical_matmul_batched<T: TropicalSemiring + KernelDispatch>(
+pub fn tropical_matmul_batched<T: TropicalSemiring + KernelDispatch + ReprTransparentTropical + Default>(
     a_batch: &[Vec<T::Scalar>],
     b_batch: &[Vec<T::Scalar>],
     m: usize,
@@ -328,7 +379,7 @@ where
 ///
 /// # Returns
 /// Vector of batch_size GemmWithArgmax results
-pub fn tropical_matmul_batched_with_argmax<T: TropicalWithArgmax<Index = u32> + KernelDispatch>(
+pub fn tropical_matmul_batched_with_argmax<T: TropicalWithArgmax<Index = u32> + KernelDispatch + ReprTransparentTropical + Default>(
     a_batch: &[Vec<T::Scalar>],
     b_batch: &[Vec<T::Scalar>],
     m: usize,
@@ -425,7 +476,7 @@ where
 /// let c = tropical_matmul_strided_batched::<TropicalMaxPlus<f32>>(&a, &b, 2, 2, 2, 2);
 /// assert_eq!(c.len(), 8); // 2 batches × 2×2 results
 /// ```
-pub fn tropical_matmul_strided_batched<T: TropicalSemiring + KernelDispatch>(
+pub fn tropical_matmul_strided_batched<T: TropicalSemiring + KernelDispatch + ReprTransparentTropical + Default>(
     a: &[T::Scalar],
     b: &[T::Scalar],
     batch_size: usize,
@@ -475,10 +526,11 @@ where
                         m,
                         n,
                         k,
-                        a_slice.as_ptr(),
+                        // Safety: T: ReprTransparentTropical guarantees T is repr(transparent) over T::Scalar
+                        a_slice.as_ptr() as *const T,
                         k,
                         Transpose::NoTrans,
-                        b_slice.as_ptr(),
+                        b_slice.as_ptr() as *const T,
                         n,
                         Transpose::NoTrans,
                         c_chunk.as_mut_ptr(),
@@ -500,10 +552,11 @@ where
                     m,
                     n,
                     k,
-                    a_slice.as_ptr(),
+                    // Safety: T: ReprTransparentTropical guarantees T is repr(transparent) over T::Scalar
+                    a_slice.as_ptr() as *const T,
                     k,
                     Transpose::NoTrans,
-                    b_slice.as_ptr(),
+                    b_slice.as_ptr() as *const T,
                     n,
                     Transpose::NoTrans,
                     c_slice.as_mut_ptr(),

@@ -4,21 +4,21 @@ use std::marker::PhantomData;
 
 use crate::core::Transpose;
 use crate::simd::{tropical_gemm_dispatch, KernelDispatch};
-use crate::types::{TropicalSemiring, TropicalWithArgmax};
+use crate::types::{ReprTransparentTropical, TropicalSemiring, TropicalWithArgmax};
 
 use super::{Mat, MatWithArgmax};
 
-/// Immutable view over scalar data interpreted as a tropical matrix.
+/// Immutable view over element data interpreted as a tropical matrix.
 ///
 /// This is a lightweight view type that can be copied freely.
-/// It references scalar data and interprets operations using the
+/// It references element data and interprets operations using the
 /// specified semiring type.
 ///
 /// ```
-/// use tropical_gemm::{MatRef, MaxPlus};
+/// use tropical_gemm::{MatRef, MaxPlus, TropicalMaxPlus};
 ///
-/// let data = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
-/// let a = MatRef::<MaxPlus<f32>>::from_slice(&data, 2, 3);
+/// let data = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0].map(TropicalMaxPlus);
+/// let a = MatRef::<MaxPlus<f32>>::from_elements(&data, 2, 3);
 ///
 /// assert_eq!(a.nrows(), 2);
 /// assert_eq!(a.ncols(), 3);
@@ -26,7 +26,7 @@ use super::{Mat, MatWithArgmax};
 /// ```
 #[derive(Debug)]
 pub struct MatRef<'a, S: TropicalSemiring> {
-    data: &'a [S::Scalar],
+    data: &'a [S],
     nrows: usize,
     ncols: usize,
     _phantom: PhantomData<S>,
@@ -41,10 +41,41 @@ impl<'a, S: TropicalSemiring> Clone for MatRef<'a, S> {
 }
 
 impl<'a, S: TropicalSemiring> MatRef<'a, S> {
-    /// Create a matrix reference from a slice of scalars.
+    /// Create a matrix reference from a slice of scalar values.
+    ///
+    /// Requires `S: ReprTransparentTropical` to guarantee safe reinterpretation
+    /// of `&[S::Scalar]` as `&[S]`.
     ///
     /// The data must be in column-major order with length `nrows * ncols`.
-    pub fn from_slice(data: &'a [S::Scalar], nrows: usize, ncols: usize) -> Self {
+    pub fn from_slice(data: &'a [S::Scalar], nrows: usize, ncols: usize) -> Self
+    where
+        S: ReprTransparentTropical,
+    {
+        assert_eq!(
+            data.len(),
+            nrows * ncols,
+            "data length {} != nrows {} * ncols {}",
+            data.len(),
+            nrows,
+            ncols
+        );
+        // Safety: S: ReprTransparentTropical guarantees S is repr(transparent) over S::Scalar,
+        // so &[S::Scalar] can be safely reinterpreted as &[S] with identical layout.
+        let element_slice = unsafe {
+            std::slice::from_raw_parts(data.as_ptr() as *const S, data.len())
+        };
+        Self {
+            data: element_slice,
+            nrows,
+            ncols,
+            _phantom: PhantomData,
+        }
+    }
+
+    /// Create a matrix reference from a slice of semiring elements.
+    ///
+    /// The data must be in column-major order with length `nrows * ncols`.
+    pub fn from_elements(data: &'a [S], nrows: usize, ncols: usize) -> Self {
         assert_eq!(
             data.len(),
             nrows * ncols,
@@ -61,32 +92,6 @@ impl<'a, S: TropicalSemiring> MatRef<'a, S> {
         }
     }
 
-    /// Create a matrix reference from an owned Mat.
-    ///
-    /// This extracts the scalar values from the semiring wrapper.
-    pub(crate) fn from_mat(mat: &'a Mat<S>) -> Self
-    where
-        S::Scalar: Copy,
-    {
-        // We need to get scalars from the Mat<S> which stores S values
-        // Since S wraps Scalar, we can use value() to extract
-        // But MatRef needs &[Scalar], not &[S]
-        // This is a design tension - for now we'll use unsafe transmute
-        // since S is repr(transparent) over Scalar
-        //
-        // Safety: TropicalMaxPlus<T>, TropicalMinPlus<T>, etc. are all
-        // repr(transparent) newtype wrappers over T
-        let scalar_slice = unsafe {
-            std::slice::from_raw_parts(mat.data.as_ptr() as *const S::Scalar, mat.data.len())
-        };
-        Self {
-            data: scalar_slice,
-            nrows: mat.nrows,
-            ncols: mat.ncols,
-            _phantom: PhantomData,
-        }
-    }
-
     /// Number of rows.
     #[inline]
     pub fn nrows(&self) -> usize {
@@ -99,10 +104,24 @@ impl<'a, S: TropicalSemiring> MatRef<'a, S> {
         self.ncols
     }
 
-    /// Get the underlying scalar data.
+    /// Get the underlying element data as a slice of `S`.
     #[inline]
-    pub fn as_slice(&self) -> &[S::Scalar] {
+    pub fn as_element_slice(&self) -> &[S] {
         self.data
+    }
+
+    /// Get the underlying data as a slice of scalars.
+    ///
+    /// Requires `S: ReprTransparentTropical` to guarantee safe reinterpretation.
+    #[inline]
+    pub fn as_slice(&self) -> &[S::Scalar]
+    where
+        S: ReprTransparentTropical,
+    {
+        // Safety: S: ReprTransparentTropical guarantees identical layout.
+        unsafe {
+            std::slice::from_raw_parts(self.data.as_ptr() as *const S::Scalar, self.data.len())
+        }
     }
 
     /// Get the scalar value at position (i, j).
@@ -124,7 +143,7 @@ impl<'a, S: TropicalSemiring> MatRef<'a, S> {
             self.ncols
         );
         // Column-major indexing
-        self.data[j * self.nrows + i]
+        self.data[j * self.nrows + i].value()
     }
 
     /// Convert to an owned matrix.
@@ -132,12 +151,12 @@ impl<'a, S: TropicalSemiring> MatRef<'a, S> {
     where
         S::Scalar: Copy,
     {
-        Mat::from_col_major(self.data, self.nrows, self.ncols)
+        Mat::from_elements(self.data.to_vec(), self.nrows, self.ncols)
     }
 }
 
 // Matrix multiplication methods
-impl<'a, S: TropicalSemiring + KernelDispatch> MatRef<'a, S> {
+impl<'a, S: TropicalSemiring + KernelDispatch + Default> MatRef<'a, S> {
     /// Perform tropical matrix multiplication: C = A ⊗ B.
     ///
     /// Computes C[i,j] = ⊕_k (A[i,k] ⊗ B[k,j])
@@ -182,7 +201,7 @@ impl<'a, S: TropicalSemiring + KernelDispatch> MatRef<'a, S> {
 // Argmax methods (separate impl block for different trait bounds)
 impl<'a, S> MatRef<'a, S>
 where
-    S: TropicalWithArgmax<Index = u32> + KernelDispatch,
+    S: TropicalWithArgmax<Index = u32> + KernelDispatch + Default,
 {
     /// Perform tropical matrix multiplication with argmax tracking.
     ///

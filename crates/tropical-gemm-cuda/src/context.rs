@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 /// CUDA kernel source code.
 const KERNEL_SOURCE: &str = include_str!("../kernels/tropical_gemm.cu");
+const COUNTING_KERNEL_SOURCE: &str = include_str!("../kernels/counting_gemm.cu");
 
 /// Blocking parameters for f32 kernels.
 pub const BLOCK_SIZE_M_F32: u32 = 64;
@@ -63,6 +64,52 @@ const KERNEL_NAMES: &[&str] = &[
     "tropical_maxmul_f32_nn_batched_with_argmax",
 ];
 
+/// Counting GEMM kernel function names. Two layouts:
+///   - AoS general: packed (value, count) inputs. Used for non-trivial input
+///     counts (future callers; currently no production caller).
+///   - ones-specialized: value-only inputs, hard-coded count=1. Used by the
+///     `count_ground_states_gpu` driver. Drops count loads, count multiply,
+///     and per-step Barrett. ~1.5-2x faster than AoS general.
+/// Each layout has naive (one thread per cell) and warpk (32 threads/cell)
+/// variants.
+const COUNTING_KERNEL_NAMES: &[&str] = &[
+    // AoS general.
+    "counting_gemm_f32_max",
+    "counting_gemm_f32_min",
+    "counting_gemm_f64_max",
+    "counting_gemm_f64_min",
+    "counting_gemm_f32_max_warpk",
+    "counting_gemm_f32_min_warpk",
+    "counting_gemm_f64_max_warpk",
+    "counting_gemm_f64_min_warpk",
+    // ones-specialized.
+    "counting_gemm_f32_max_ones",
+    "counting_gemm_f32_min_ones",
+    "counting_gemm_f64_max_ones",
+    "counting_gemm_f64_min_ones",
+    "counting_gemm_f32_max_warpk_ones",
+    "counting_gemm_f32_min_warpk_ones",
+    "counting_gemm_f64_max_warpk_ones",
+    "counting_gemm_f64_min_warpk_ones",
+];
+
+/// Dispatch knob #1: minimum K to consider warpk. Below this, the warp-stride
+/// inner loop has too few iterations to amortize the 5-step shuffle reduce.
+pub const COUNTING_WARPK_K_THRESHOLD: usize = 64;
+
+/// Dispatch knob #2: maximum M*N for warpk. Re-tuned for Spec H (transposed
+/// B). With coalesced lane loads, warpk's kernel-only time wins across the
+/// entire tested range up to 1024² at K=4096. The bound here accounts for
+/// host-side transpose overhead: the warpk regime requires uploading B in
+/// N×K layout, which costs ~K·N·sizeof(T) host bytes amortized across the
+/// CRT prime loop. At M·N ≤ 128² the kernel speedup dominates the transpose
+/// cost even on single-prime calls. Beyond that, multi-prime calls still
+/// favor warpk but single-prime calls flip; conservative ceiling.
+pub const COUNTING_WARPK_MN_CEILING: usize = 128 * 128;
+
+/// Block height for warpk kernels (number of output rows per block).
+pub const COUNTING_WARPK_ROWS_PER_BLOCK: u32 = 4;
+
 /// CUDA context for tropical GEMM operations.
 ///
 /// Manages device selection, kernel compilation, and caching.
@@ -91,11 +138,21 @@ impl CudaContext {
         // Load PTX module
         device.load_ptx(ptx, "tropical_gemm", KERNEL_NAMES)?;
 
+        // Compile + load counting GEMM kernels (spec C).
+        let counting_ptx = cudarc::nvrtc::compile_ptx(COUNTING_KERNEL_SOURCE)?;
+        device.load_ptx(counting_ptx, "counting_gemm", COUNTING_KERNEL_NAMES)?;
+
         // Cache kernel functions
         let mut kernels = HashMap::new();
         for name in KERNEL_NAMES {
             let func = device
                 .get_func("tropical_gemm", name)
+                .ok_or_else(|| CudaError::KernelNotFound(name.to_string()))?;
+            kernels.insert(*name, func);
+        }
+        for name in COUNTING_KERNEL_NAMES {
+            let func = device
+                .get_func("counting_gemm", name)
                 .ok_or_else(|| CudaError::KernelNotFound(name.to_string()))?;
             kernels.insert(*name, func);
         }
@@ -147,5 +204,39 @@ impl CudaContext {
         let bszm = BLOCK_SIZE_M_F64 / THREAD_SIZE_M;
         let bszn = BLOCK_SIZE_N_F64 / THREAD_SIZE_N;
         (bszm, bszn, 1)
+    }
+
+    /// Counting kernel block dims (naive: one thread per output cell).
+    pub fn counting_block_dims_f32() -> (u32, u32, u32) {
+        (16, 16, 1)
+    }
+
+    /// Grid dims: one block covers a 16×16 output tile.
+    pub fn counting_grid_dims_f32(m: usize, n: usize) -> (u32, u32, u32) {
+        let (bx, by, _) = Self::counting_block_dims_f32();
+        let gx = ((n as u32) + bx - 1) / bx;
+        let gy = ((m as u32) + by - 1) / by;
+        (gx, gy, 1)
+    }
+
+    pub fn counting_block_dims_f64() -> (u32, u32, u32) {
+        (16, 16, 1)
+    }
+
+    pub fn counting_grid_dims_f64(m: usize, n: usize) -> (u32, u32, u32) {
+        Self::counting_grid_dims_f32(m, n)
+    }
+
+    /// Block dims for warp-K-reduction kernels: 32 lanes × 4 rows-per-block.
+    pub fn counting_warpk_block_dims() -> (u32, u32, u32) {
+        (32, COUNTING_WARPK_ROWS_PER_BLOCK, 1)
+    }
+
+    /// Grid dims for warp-K-reduction kernels: one block per
+    /// (rows-tile, column). gridDim.x = N, gridDim.y = ceil(M / rows-per-block).
+    pub fn counting_warpk_grid_dims(m: usize, n: usize) -> (u32, u32, u32) {
+        let rows = COUNTING_WARPK_ROWS_PER_BLOCK;
+        let gy = ((m as u32) + rows - 1) / rows;
+        (n as u32, gy, 1)
     }
 }

@@ -27,14 +27,14 @@ use crate::types::{TropicalSemiring, TropicalWithArgmax};
 /// # Safety
 /// - All pointers must be valid for the specified dimensions
 /// - Memory regions must not overlap inappropriately
-pub unsafe fn tropical_gemm_portable<T: TropicalSemiring>(
+pub unsafe fn tropical_gemm_portable<T: TropicalSemiring + Default>(
     m: usize,
     n: usize,
     k: usize,
-    a: *const T::Scalar,
+    a: *const T,
     lda: usize,
     trans_a: Transpose,
-    b: *const T::Scalar,
+    b: *const T,
     ldb: usize,
     trans_b: Transpose,
     c: *mut T,
@@ -52,14 +52,14 @@ pub unsafe fn tropical_gemm_portable<T: TropicalSemiring>(
 ///
 /// # Safety
 /// Same requirements as `tropical_gemm_portable`
-pub unsafe fn tropical_gemm_inner<T: TropicalSemiring, K: Microkernel<T>>(
+pub unsafe fn tropical_gemm_inner<T: TropicalSemiring + Default, K: Microkernel<T>>(
     m: usize,
     n: usize,
     k: usize,
-    a: *const T::Scalar,
+    a: *const T,
     lda: usize,
     trans_a: Transpose,
-    b: *const T::Scalar,
+    b: *const T,
     ldb: usize,
     trans_b: Transpose,
     c: *mut T,
@@ -75,8 +75,8 @@ pub unsafe fn tropical_gemm_inner<T: TropicalSemiring, K: Microkernel<T>>(
     // For repeated GEMM calls, consider adding a workspace-based API:
     //   pub struct GemmWorkspace<T> { packed_a: Vec<T>, packed_b: Vec<T> }
     //   pub fn tropical_gemm_with_workspace(..., workspace: &mut GemmWorkspace<T>)
-    let mut packed_a = vec![T::Scalar::scalar_zero(); packed_a_size(params.mc, params.kc, K::MR)];
-    let mut packed_b = vec![T::Scalar::scalar_zero(); packed_b_size(params.kc, params.nc, K::NR)];
+    let mut packed_a = vec![T::default(); packed_a_size(params.mc, params.kc, K::MR)];
+    let mut packed_b = vec![T::default(); packed_b_size(params.kc, params.nc, K::NR)];
 
     // BLIS-style 5-loop blocking
     // Loop 5: blocks of n
@@ -84,7 +84,7 @@ pub unsafe fn tropical_gemm_inner<T: TropicalSemiring, K: Microkernel<T>>(
         // Loop 4: blocks of k
         for (pc, kc) in BlockIterator::new(k, params.kc) {
             // Pack B panel: kc × nc
-            pack_b::<T::Scalar>(
+            pack_b::<T>(
                 kc,
                 nc,
                 b_panel_ptr(b, pc, jc, ldb, trans_b),
@@ -98,7 +98,7 @@ pub unsafe fn tropical_gemm_inner<T: TropicalSemiring, K: Microkernel<T>>(
             // Loop 3: blocks of m
             for (ic, mc) in BlockIterator::new(m, params.mc) {
                 // Pack A panel: mc × kc
-                pack_a::<T::Scalar>(
+                pack_a::<T>(
                     mc,
                     kc,
                     a_panel_ptr(a, ic, pc, lda, trans_a),
@@ -140,14 +140,14 @@ pub unsafe fn tropical_gemm_inner<T: TropicalSemiring, K: Microkernel<T>>(
 ///
 /// # Safety
 /// Same requirements as `tropical_gemm_portable`
-pub unsafe fn tropical_gemm_with_argmax_portable<T: TropicalWithArgmax<Index = u32>>(
+pub unsafe fn tropical_gemm_with_argmax_portable<T: TropicalWithArgmax<Index = u32> + Default>(
     m: usize,
     n: usize,
     k: usize,
-    a: *const T::Scalar,
+    a: *const T,
     lda: usize,
     trans_a: Transpose,
-    b: *const T::Scalar,
+    b: *const T,
     ldb: usize,
     trans_b: Transpose,
     result: &mut GemmWithArgmax<T>,
@@ -165,16 +165,16 @@ pub unsafe fn tropical_gemm_with_argmax_portable<T: TropicalWithArgmax<Index = u
 /// # Safety
 /// Same requirements as `tropical_gemm_portable`
 pub unsafe fn tropical_gemm_with_argmax_inner<
-    T: TropicalWithArgmax<Index = u32>,
+    T: TropicalWithArgmax<Index = u32> + Default,
     K: MicrokernelWithArgmax<T>,
 >(
     m: usize,
     n: usize,
     k: usize,
-    a: *const T::Scalar,
+    a: *const T,
     lda: usize,
     trans_a: Transpose,
-    b: *const T::Scalar,
+    b: *const T,
     ldb: usize,
     trans_b: Transpose,
     result: &mut GemmWithArgmax<T>,
@@ -189,13 +189,13 @@ pub unsafe fn tropical_gemm_with_argmax_inner<
     let (c, argmax) = result.as_mut_ptrs();
 
     // TODO(#34): Avoid repeated allocation by accepting caller-provided workspace.
-    let mut packed_a = vec![T::Scalar::scalar_zero(); packed_a_size(params.mc, params.kc, K::MR)];
-    let mut packed_b = vec![T::Scalar::scalar_zero(); packed_b_size(params.kc, params.nc, K::NR)];
+    let mut packed_a = vec![T::default(); packed_a_size(params.mc, params.kc, K::MR)];
+    let mut packed_b = vec![T::default(); packed_b_size(params.kc, params.nc, K::NR)];
 
     // BLIS-style 5-loop blocking
     for (jc, nc) in BlockIterator::new(n, params.nc) {
         for (pc, kc) in BlockIterator::new(k, params.kc) {
-            pack_b::<T::Scalar>(
+            pack_b::<T>(
                 kc,
                 nc,
                 b_panel_ptr(b, pc, jc, ldb, trans_b),
@@ -207,7 +207,7 @@ pub unsafe fn tropical_gemm_with_argmax_inner<
             );
 
             for (ic, mc) in BlockIterator::new(m, params.mc) {
-                pack_a::<T::Scalar>(
+                pack_a::<T>(
                     mc,
                     kc,
                     a_panel_ptr(a, ic, pc, lda, trans_a),
@@ -273,8 +273,6 @@ unsafe fn b_panel_ptr<T>(
     }
 }
 
-use crate::types::TropicalScalar;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -287,17 +285,10 @@ mod tests {
         let k = 3;
 
         // A: 2x3 matrix
-        let a: [f64; 6] = [
-            1.0, 2.0, 3.0, // row 0
-            4.0, 5.0, 6.0, // row 1
-        ];
+        let a = [1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0].map(TropicalMaxPlus);
 
         // B: 3x2 matrix
-        let b: [f64; 6] = [
-            1.0, 2.0, // row 0
-            3.0, 4.0, // row 1
-            5.0, 6.0, // row 2
-        ];
+        let b = [1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0].map(TropicalMaxPlus);
 
         let mut c = vec![TropicalMaxPlus::tropical_zero(); m * n];
 
@@ -333,8 +324,8 @@ mod tests {
         let n = 2;
         let k = 3;
 
-        let a: [f64; 6] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
-        let b: [f64; 6] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let a = [1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0].map(TropicalMaxPlus);
+        let b = [1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0].map(TropicalMaxPlus);
 
         let mut result: GemmWithArgmax<TropicalMaxPlus<f64>> = GemmWithArgmax::new(m, n);
 
@@ -372,15 +363,15 @@ mod tests {
         // Design A and B so each C[i,j] has a different optimal k
         // A: 2x3, B: 3x2
         // C[i,j] = max_k(A[i,k] + B[k,j])
-        let a: [f64; 6] = [
-            10.0, 1.0, 1.0, // row 0: k=0 dominates for C[0,*]
+        let a = [
+            10.0_f64, 1.0, 1.0, // row 0: k=0 dominates for C[0,*]
             1.0, 1.0, 10.0, // row 1: k=2 dominates for C[1,*]
-        ];
-        let b: [f64; 6] = [
-            10.0, 1.0, // row 0: col 0 prefers k=0
+        ].map(TropicalMaxPlus);
+        let b = [
+            10.0_f64, 1.0, // row 0: col 0 prefers k=0
             1.0, 10.0, // row 1: col 1 prefers k=1
             1.0, 1.0, // row 2
-        ];
+        ].map(TropicalMaxPlus);
 
         let mut result: GemmWithArgmax<TropicalMaxPlus<f64>> = GemmWithArgmax::new(m, n);
 
@@ -426,15 +417,15 @@ mod tests {
         let k = 3;
 
         // For MinPlus, argmax tracks argmin
-        let a: [f64; 6] = [
-            1.0, 5.0, 3.0, // row 0
+        let a = [
+            1.0_f64, 5.0, 3.0, // row 0
             2.0, 4.0, 6.0, // row 1
-        ];
-        let b: [f64; 6] = [
-            1.0, 2.0, // row 0
+        ].map(TropicalMinPlus);
+        let b = [
+            1.0_f64, 2.0, // row 0
             3.0, 4.0, // row 1
             5.0, 6.0, // row 2
-        ];
+        ].map(TropicalMinPlus);
 
         let mut result: GemmWithArgmax<TropicalMinPlus<f64>> = GemmWithArgmax::new(m, n);
 
@@ -477,8 +468,8 @@ mod tests {
         let n = 8;
         let k = 8;
 
-        let a: Vec<f64> = (0..m * k).map(|i| i as f64).collect();
-        let b: Vec<f64> = (0..k * n).map(|i| (k * n - 1 - i) as f64).collect();
+        let a: Vec<TropicalMaxPlus<f64>> = (0..m * k).map(|i| TropicalMaxPlus(i as f64)).collect();
+        let b: Vec<TropicalMaxPlus<f64>> = (0..k * n).map(|i| TropicalMaxPlus((k * n - 1 - i) as f64)).collect();
 
         let mut result: GemmWithArgmax<TropicalMaxPlus<f64>> = GemmWithArgmax::new(m, n);
 
@@ -515,17 +506,17 @@ mod tests {
         let n = 2;
         let k = 3;
 
-        let a: [f64; 6] = [
-            1.0, 4.0, // column 0
+        let a = [
+            1.0_f64, 4.0, // column 0
             2.0, 5.0, // column 1
             3.0, 6.0, // column 2
-        ];
+        ].map(TropicalMaxPlus);
 
-        let b: [f64; 6] = [
-            1.0, 2.0, // row 0
+        let b = [
+            1.0_f64, 2.0, // row 0
             3.0, 4.0, // row 1
             5.0, 6.0, // row 2
-        ];
+        ].map(TropicalMaxPlus);
 
         let mut c = vec![TropicalMaxPlus::tropical_zero(); m * n];
 
@@ -565,16 +556,16 @@ mod tests {
         let n = 2;
         let k = 3;
 
-        let a: [f64; 6] = [
-            1.0, 2.0, 3.0, // row 0
+        let a = [
+            1.0_f64, 2.0, 3.0, // row 0
             4.0, 5.0, 6.0, // row 1
-        ];
+        ].map(TropicalMaxPlus);
 
         // B stored column-major: columns are [1,3,5], [2,4,6]
-        let b: [f64; 6] = [
-            1.0, 3.0, 5.0, // column 0 of B^T = row of B
+        let b = [
+            1.0_f64, 3.0, 5.0, // column 0 of B^T = row of B
             2.0, 4.0, 6.0, // column 1 of B^T
-        ];
+        ].map(TropicalMaxPlus);
 
         let mut c = vec![TropicalMaxPlus::tropical_zero(); m * n];
 
@@ -611,9 +602,9 @@ mod tests {
         let k = 3;
 
         // A column-major (3x2), A^T is 2x3
-        let a: [f64; 6] = [1.0, 4.0, 2.0, 5.0, 3.0, 6.0];
+        let a = [1.0_f64, 4.0, 2.0, 5.0, 3.0, 6.0].map(TropicalMaxPlus);
         // B column-major (2x3), B^T is 3x2
-        let b: [f64; 6] = [1.0, 3.0, 5.0, 2.0, 4.0, 6.0];
+        let b = [1.0_f64, 3.0, 5.0, 2.0, 4.0, 6.0].map(TropicalMaxPlus);
 
         let mut c = vec![TropicalMaxPlus::tropical_zero(); m * n];
 
@@ -645,8 +636,8 @@ mod tests {
         let n = 2;
         let k = 3;
 
-        let a: [f64; 0] = [];
-        let b: [f64; 6] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let a: [TropicalMaxPlus<f64>; 0] = [];
+        let b = [1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0].map(TropicalMaxPlus);
         let mut c: Vec<TropicalMaxPlus<f64>> = vec![];
 
         unsafe {
@@ -675,8 +666,8 @@ mod tests {
         let n = 0;
         let k = 3;
 
-        let a: [f64; 6] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
-        let b: [f64; 0] = [];
+        let a = [1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0].map(TropicalMaxPlus);
+        let b: [TropicalMaxPlus<f64>; 0] = [];
         let mut c: Vec<TropicalMaxPlus<f64>> = vec![];
 
         unsafe {
@@ -704,8 +695,8 @@ mod tests {
         let n = 2;
         let k = 0;
 
-        let a: [f64; 0] = [];
-        let b: [f64; 0] = [];
+        let a: [TropicalMaxPlus<f64>; 0] = [];
+        let b: [TropicalMaxPlus<f64>; 0] = [];
         let mut c = vec![TropicalMaxPlus::tropical_zero(); m * n];
 
         unsafe {
@@ -736,8 +727,8 @@ mod tests {
         let n = 2;
         let k = 0;
 
-        let a: [f64; 0] = [];
-        let b: [f64; 0] = [];
+        let a: [TropicalMaxPlus<f64>; 0] = [];
+        let b: [TropicalMaxPlus<f64>; 0] = [];
         let mut result: GemmWithArgmax<TropicalMaxPlus<f64>> = GemmWithArgmax::new(m, n);
 
         unsafe {
@@ -766,8 +757,8 @@ mod tests {
         let n = 2;
         let k = 3;
 
-        let a: [f64; 6] = [1.0, 4.0, 2.0, 5.0, 3.0, 6.0];
-        let b: [f64; 6] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let a = [1.0_f64, 4.0, 2.0, 5.0, 3.0, 6.0].map(TropicalMaxPlus);
+        let b = [1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0].map(TropicalMaxPlus);
 
         let mut result: GemmWithArgmax<TropicalMaxPlus<f64>> = GemmWithArgmax::new(m, n);
 
@@ -796,8 +787,8 @@ mod tests {
         let n = 2;
         let k = 3;
 
-        let a: [f64; 6] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
-        let b: [f64; 6] = [1.0, 3.0, 5.0, 2.0, 4.0, 6.0];
+        let a = [1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0].map(TropicalMaxPlus);
+        let b = [1.0_f64, 3.0, 5.0, 2.0, 4.0, 6.0].map(TropicalMaxPlus);
 
         let mut result: GemmWithArgmax<TropicalMaxPlus<f64>> = GemmWithArgmax::new(m, n);
 

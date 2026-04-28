@@ -7,14 +7,14 @@ use crate::types::{TropicalMaxMul, TropicalMaxPlus, TropicalMinPlus, TropicalSem
 ///
 /// # Safety
 /// Same requirements as `tropical_gemm_inner`
-pub unsafe fn tropical_gemm_dispatch<T: TropicalSemiring + KernelDispatch>(
+pub unsafe fn tropical_gemm_dispatch<T: TropicalSemiring + KernelDispatch + Default>(
     m: usize,
     n: usize,
     k: usize,
-    a: *const T::Scalar,
+    a: *const T,
     lda: usize,
     trans_a: Transpose,
-    b: *const T::Scalar,
+    b: *const T,
     ldb: usize,
     trans_b: Transpose,
     c: *mut T,
@@ -30,10 +30,10 @@ pub trait KernelDispatch: TropicalSemiring {
         m: usize,
         n: usize,
         k: usize,
-        a: *const Self::Scalar,
+        a: *const Self,
         lda: usize,
         trans_a: Transpose,
-        b: *const Self::Scalar,
+        b: *const Self,
         ldb: usize,
         trans_b: Transpose,
         c: *mut Self,
@@ -46,10 +46,10 @@ impl KernelDispatch for TropicalMaxPlus<f32> {
         m: usize,
         n: usize,
         k: usize,
-        a: *const f32,
+        a: *const Self,
         lda: usize,
         trans_a: Transpose,
-        b: *const f32,
+        b: *const Self,
         ldb: usize,
         trans_b: Transpose,
         c: *mut Self,
@@ -88,10 +88,10 @@ impl KernelDispatch for TropicalMaxPlus<f64> {
         m: usize,
         n: usize,
         k: usize,
-        a: *const f64,
+        a: *const Self,
         lda: usize,
         trans_a: Transpose,
-        b: *const f64,
+        b: *const Self,
         ldb: usize,
         trans_b: Transpose,
         c: *mut Self,
@@ -130,10 +130,10 @@ impl KernelDispatch for TropicalMinPlus<f32> {
         m: usize,
         n: usize,
         k: usize,
-        a: *const f32,
+        a: *const Self,
         lda: usize,
         trans_a: Transpose,
-        b: *const f32,
+        b: *const Self,
         ldb: usize,
         trans_b: Transpose,
         c: *mut Self,
@@ -172,10 +172,10 @@ impl KernelDispatch for TropicalMaxMul<f32> {
         m: usize,
         n: usize,
         k: usize,
-        a: *const f32,
+        a: *const Self,
         lda: usize,
         trans_a: Transpose,
-        b: *const f32,
+        b: *const Self,
         ldb: usize,
         trans_b: Transpose,
         c: *mut Self,
@@ -210,10 +210,10 @@ macro_rules! impl_kernel_dispatch_portable {
                     m: usize,
                     n: usize,
                     k: usize,
-                    a: *const Self::Scalar,
+                    a: *const Self,
                     lda: usize,
                     trans_a: Transpose,
-                    b: *const Self::Scalar,
+                    b: *const Self,
                     ldb: usize,
                     trans_b: Transpose,
                     c: *mut Self,
@@ -241,6 +241,34 @@ impl_kernel_dispatch_portable!(
     TropicalMaxMul<i64>
 );
 
+// CountingTropical is a compound element: route all variants to the portable kernel.
+impl<T, C, D> KernelDispatch for crate::types::CountingTropical<T, C, D>
+where
+    T: crate::types::TropicalScalar,
+    C: crate::types::TropicalScalar,
+    D: crate::types::TropicalDirection,
+{
+    unsafe fn dispatch_gemm(
+        m: usize,
+        n: usize,
+        k: usize,
+        a: *const Self,
+        lda: usize,
+        trans_a: Transpose,
+        b: *const Self,
+        ldb: usize,
+        trans_b: Transpose,
+        c: *mut Self,
+        ldc: usize,
+    ) {
+        let kernel = PortableKernel;
+        let params = TilingParams::PORTABLE;
+        tropical_gemm_inner::<Self, _>(
+            m, n, k, a, lda, trans_a, b, ldb, trans_b, c, ldc, &params, &kernel,
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,8 +276,8 @@ mod tests {
     // Test that the dispatch function exists and doesn't panic for small inputs
     #[test]
     fn test_dispatch_maxplus_f32() {
-        let a = vec![1.0f32, 2.0, 3.0, 4.0];
-        let b = vec![1.0f32, 2.0, 3.0, 4.0];
+        let a: Vec<TropicalMaxPlus<f32>> = [1.0f32, 2.0, 3.0, 4.0].map(TropicalMaxPlus).to_vec();
+        let b: Vec<TropicalMaxPlus<f32>> = [1.0f32, 2.0, 3.0, 4.0].map(TropicalMaxPlus).to_vec();
         let mut c = vec![TropicalMaxPlus::tropical_zero(); 4];
 
         unsafe {
@@ -274,8 +302,8 @@ mod tests {
 
     #[test]
     fn test_dispatch_maxplus_f64() {
-        let a = vec![1.0f64, 2.0, 3.0, 4.0];
-        let b = vec![1.0f64, 2.0, 3.0, 4.0];
+        let a: Vec<TropicalMaxPlus<f64>> = [1.0f64, 2.0, 3.0, 4.0].map(TropicalMaxPlus).to_vec();
+        let b: Vec<TropicalMaxPlus<f64>> = [1.0f64, 2.0, 3.0, 4.0].map(TropicalMaxPlus).to_vec();
         let mut c = vec![TropicalMaxPlus::tropical_zero(); 4];
 
         unsafe {
@@ -299,8 +327,8 @@ mod tests {
 
     #[test]
     fn test_dispatch_minplus_f32() {
-        let a = vec![1.0f32, 2.0, 3.0, 4.0];
-        let b = vec![1.0f32, 2.0, 3.0, 4.0];
+        let a: Vec<TropicalMinPlus<f32>> = [1.0f32, 2.0, 3.0, 4.0].map(TropicalMinPlus).to_vec();
+        let b: Vec<TropicalMinPlus<f32>> = [1.0f32, 2.0, 3.0, 4.0].map(TropicalMinPlus).to_vec();
         let mut c = vec![TropicalMinPlus::tropical_zero(); 4];
 
         unsafe {
@@ -325,8 +353,8 @@ mod tests {
 
     #[test]
     fn test_dispatch_minplus_f64() {
-        let a = vec![1.0f64, 2.0, 3.0, 4.0];
-        let b = vec![1.0f64, 2.0, 3.0, 4.0];
+        let a: Vec<TropicalMinPlus<f64>> = [1.0f64, 2.0, 3.0, 4.0].map(TropicalMinPlus).to_vec();
+        let b: Vec<TropicalMinPlus<f64>> = [1.0f64, 2.0, 3.0, 4.0].map(TropicalMinPlus).to_vec();
         let mut c = vec![TropicalMinPlus::tropical_zero(); 4];
 
         unsafe {
@@ -350,8 +378,8 @@ mod tests {
 
     #[test]
     fn test_dispatch_maxmul_f32() {
-        let a = vec![2.0f32, 3.0, 4.0, 5.0];
-        let b = vec![1.0f32, 2.0, 3.0, 4.0];
+        let a: Vec<TropicalMaxMul<f32>> = [2.0f32, 3.0, 4.0, 5.0].map(TropicalMaxMul).to_vec();
+        let b: Vec<TropicalMaxMul<f32>> = [1.0f32, 2.0, 3.0, 4.0].map(TropicalMaxMul).to_vec();
         let mut c = vec![TropicalMaxMul::tropical_zero(); 4];
 
         unsafe {
@@ -376,8 +404,8 @@ mod tests {
 
     #[test]
     fn test_dispatch_maxmul_f64() {
-        let a = vec![2.0f64, 3.0, 4.0, 5.0];
-        let b = vec![1.0f64, 2.0, 3.0, 4.0];
+        let a: Vec<TropicalMaxMul<f64>> = [2.0f64, 3.0, 4.0, 5.0].map(TropicalMaxMul).to_vec();
+        let b: Vec<TropicalMaxMul<f64>> = [1.0f64, 2.0, 3.0, 4.0].map(TropicalMaxMul).to_vec();
         let mut c = vec![TropicalMaxMul::tropical_zero(); 4];
 
         unsafe {
@@ -401,8 +429,8 @@ mod tests {
 
     #[test]
     fn test_dispatch_maxplus_i32() {
-        let a = vec![1i32, 2, 3, 4];
-        let b = vec![1i32, 2, 3, 4];
+        let a: Vec<TropicalMaxPlus<i32>> = [1i32, 2, 3, 4].map(TropicalMaxPlus).to_vec();
+        let b: Vec<TropicalMaxPlus<i32>> = [1i32, 2, 3, 4].map(TropicalMaxPlus).to_vec();
         let mut c = vec![TropicalMaxPlus::tropical_zero(); 4];
 
         unsafe {
@@ -426,8 +454,8 @@ mod tests {
 
     #[test]
     fn test_dispatch_maxplus_i64() {
-        let a = vec![1i64, 2, 3, 4];
-        let b = vec![1i64, 2, 3, 4];
+        let a: Vec<TropicalMaxPlus<i64>> = [1i64, 2, 3, 4].map(TropicalMaxPlus).to_vec();
+        let b: Vec<TropicalMaxPlus<i64>> = [1i64, 2, 3, 4].map(TropicalMaxPlus).to_vec();
         let mut c = vec![TropicalMaxPlus::tropical_zero(); 4];
 
         unsafe {
@@ -451,8 +479,8 @@ mod tests {
 
     #[test]
     fn test_dispatch_minplus_i32() {
-        let a = vec![1i32, 2, 3, 4];
-        let b = vec![1i32, 2, 3, 4];
+        let a: Vec<TropicalMinPlus<i32>> = [1i32, 2, 3, 4].map(TropicalMinPlus).to_vec();
+        let b: Vec<TropicalMinPlus<i32>> = [1i32, 2, 3, 4].map(TropicalMinPlus).to_vec();
         let mut c = vec![TropicalMinPlus::tropical_zero(); 4];
 
         unsafe {
@@ -476,8 +504,8 @@ mod tests {
 
     #[test]
     fn test_dispatch_minplus_i64() {
-        let a = vec![1i64, 2, 3, 4];
-        let b = vec![1i64, 2, 3, 4];
+        let a: Vec<TropicalMinPlus<i64>> = [1i64, 2, 3, 4].map(TropicalMinPlus).to_vec();
+        let b: Vec<TropicalMinPlus<i64>> = [1i64, 2, 3, 4].map(TropicalMinPlus).to_vec();
         let mut c = vec![TropicalMinPlus::tropical_zero(); 4];
 
         unsafe {
@@ -501,8 +529,8 @@ mod tests {
 
     #[test]
     fn test_dispatch_maxmul_i32() {
-        let a = vec![2i32, 3, 4, 5];
-        let b = vec![1i32, 2, 3, 4];
+        let a: Vec<TropicalMaxMul<i32>> = [2i32, 3, 4, 5].map(TropicalMaxMul).to_vec();
+        let b: Vec<TropicalMaxMul<i32>> = [1i32, 2, 3, 4].map(TropicalMaxMul).to_vec();
         let mut c = vec![TropicalMaxMul::tropical_zero(); 4];
 
         unsafe {
@@ -526,8 +554,8 @@ mod tests {
 
     #[test]
     fn test_dispatch_maxmul_i64() {
-        let a = vec![2i64, 3, 4, 5];
-        let b = vec![1i64, 2, 3, 4];
+        let a: Vec<TropicalMaxMul<i64>> = [2i64, 3, 4, 5].map(TropicalMaxMul).to_vec();
+        let b: Vec<TropicalMaxMul<i64>> = [1i64, 2, 3, 4].map(TropicalMaxMul).to_vec();
         let mut c = vec![TropicalMaxMul::tropical_zero(); 4];
 
         unsafe {
@@ -556,8 +584,8 @@ mod tests {
         let n = 16;
         let k = 16;
 
-        let a: Vec<f32> = (0..m * k).map(|i| (i % 10) as f32).collect();
-        let b: Vec<f32> = (0..k * n).map(|i| (i % 10) as f32).collect();
+        let a: Vec<TropicalMaxPlus<f32>> = (0..m * k).map(|i| TropicalMaxPlus((i % 10) as f32)).collect();
+        let b: Vec<TropicalMaxPlus<f32>> = (0..k * n).map(|i| TropicalMaxPlus((i % 10) as f32)).collect();
         let mut c = vec![TropicalMaxPlus::tropical_zero(); m * n];
 
         unsafe {

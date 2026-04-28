@@ -17,8 +17,8 @@ pub trait Microkernel<T: TropicalSemiring> {
     /// where the result is combined with existing C values using tropical addition.
     ///
     /// # Safety
-    /// - `a` must point to at least `mr * k` elements (packed column-major)
-    /// - `b` must point to at least `k * nr` elements (packed row-major)
+    /// - `a` must point to at least `mr * k` elements of type `T` (packed column-major)
+    /// - `b` must point to at least `k * nr` elements of type `T` (packed row-major)
     /// - `c` must point to at least `mr * ldc` elements
     /// - `mr <= Self::MR` and `nr <= Self::NR`
     unsafe fn execute(
@@ -26,8 +26,8 @@ pub trait Microkernel<T: TropicalSemiring> {
         mr: usize,
         nr: usize,
         k: usize,
-        a: *const T::Scalar,
-        b: *const T::Scalar,
+        a: *const T,
+        b: *const T,
         c: *mut T,
         ldc: usize,
     );
@@ -49,8 +49,8 @@ pub trait MicrokernelWithArgmax<T: TropicalWithArgmax<Index = u32>>: Microkernel
         nr: usize,
         k: usize,
         k_offset: usize,
-        a: *const T::Scalar,
-        b: *const T::Scalar,
+        a: *const T,
+        b: *const T,
         c: *mut T,
         argmax: *mut u32,
         ldc: usize,
@@ -78,8 +78,8 @@ impl<T: TropicalSemiring> Microkernel<T> for PortableMicrokernel {
         mr: usize,
         nr: usize,
         k: usize,
-        a: *const T::Scalar,
-        b: *const T::Scalar,
+        a: *const T,
+        b: *const T,
         c: *mut T,
         ldc: usize,
     ) {
@@ -97,9 +97,9 @@ impl<T: TropicalSemiring> Microkernel<T> for PortableMicrokernel {
         // Main loop
         for p in 0..k {
             for i in 0..mr {
-                let a_val = T::from_scalar(*a.add(p * MR + i));
+                let a_val = *a.add(p * MR + i);
                 for j in 0..nr {
-                    let b_val = T::from_scalar(*b.add(p * NR + j));
+                    let b_val = *b.add(p * NR + j);
                     let product = a_val.tropical_mul(b_val);
                     acc[i][j] = acc[i][j].tropical_add(product);
                 }
@@ -122,8 +122,8 @@ impl<T: TropicalWithArgmax<Index = u32>> MicrokernelWithArgmax<T> for PortableMi
         nr: usize,
         k: usize,
         k_offset: usize,
-        a: *const T::Scalar,
-        b: *const T::Scalar,
+        a: *const T,
+        b: *const T,
         c: *mut T,
         argmax: *mut u32,
         ldc: usize,
@@ -145,9 +145,9 @@ impl<T: TropicalWithArgmax<Index = u32>> MicrokernelWithArgmax<T> for PortableMi
         for p in 0..k {
             let current_k = (k_offset + p) as u32;
             for i in 0..mr {
-                let a_val = T::from_scalar(*a.add(p * MR + i));
+                let a_val = *a.add(p * MR + i);
                 for j in 0..nr {
-                    let b_val = T::from_scalar(*b.add(p * NR + j));
+                    let b_val = *b.add(p * NR + j);
                     let product = a_val.tropical_mul(b_val);
                     let (new_acc, new_idx) =
                         acc[i][j].tropical_add_argmax(idx[i][j], product, current_k);
@@ -182,13 +182,15 @@ mod tests {
         // A: 2x3 matrix (packed column-major in MR chunks)
         // A = [[1, 2, 3],
         //      [4, 5, 6]]
-        let a: [f64; 12] = [1.0, 4.0, 0.0, 0.0, 2.0, 5.0, 0.0, 0.0, 3.0, 6.0, 0.0, 0.0];
+        let a = [1.0_f64, 4.0, 0.0, 0.0, 2.0, 5.0, 0.0, 0.0, 3.0, 6.0, 0.0, 0.0]
+            .map(TropicalMaxPlus);
 
         // B: 3x2 matrix (packed row-major in NR chunks)
         // B = [[1, 2],
         //      [3, 4],
         //      [5, 6]]
-        let b: [f64; 12] = [1.0, 2.0, 0.0, 0.0, 3.0, 4.0, 0.0, 0.0, 5.0, 6.0, 0.0, 0.0];
+        let b = [1.0_f64, 2.0, 0.0, 0.0, 3.0, 4.0, 0.0, 0.0, 5.0, 6.0, 0.0, 0.0]
+            .map(TropicalMaxPlus);
 
         // C: 2x2 output
         let mut c = [TropicalMaxPlus::tropical_zero(); 4];
@@ -221,8 +223,10 @@ mod tests {
         let nr = 2;
         let k = 3;
 
-        let a: [f64; 12] = [1.0, 4.0, 0.0, 0.0, 2.0, 5.0, 0.0, 0.0, 3.0, 6.0, 0.0, 0.0];
-        let b: [f64; 12] = [1.0, 2.0, 0.0, 0.0, 3.0, 4.0, 0.0, 0.0, 5.0, 6.0, 0.0, 0.0];
+        let a = [1.0_f64, 4.0, 0.0, 0.0, 2.0, 5.0, 0.0, 0.0, 3.0, 6.0, 0.0, 0.0]
+            .map(TropicalMinPlus);
+        let b = [1.0_f64, 2.0, 0.0, 0.0, 3.0, 4.0, 0.0, 0.0, 5.0, 6.0, 0.0, 0.0]
+            .map(TropicalMinPlus);
 
         let mut c = [TropicalMinPlus::tropical_zero(); 4];
         let ldc = 2;
@@ -251,9 +255,9 @@ mod tests {
         let k = 2;
 
         // A: [[2, 4], [3, 5]]
-        let a: [f64; 8] = [2.0, 3.0, 0.0, 0.0, 4.0, 5.0, 0.0, 0.0];
+        let a = [2.0_f64, 3.0, 0.0, 0.0, 4.0, 5.0, 0.0, 0.0].map(TropicalMaxMul);
         // B: [[1, 2], [3, 4]]
-        let b: [f64; 8] = [1.0, 2.0, 0.0, 0.0, 3.0, 4.0, 0.0, 0.0];
+        let b = [1.0_f64, 2.0, 0.0, 0.0, 3.0, 4.0, 0.0, 0.0].map(TropicalMaxMul);
 
         let mut c = [TropicalMaxMul::tropical_zero(); 4];
         let ldc = 2;
@@ -279,8 +283,10 @@ mod tests {
         let nr = 2;
         let k = 3;
 
-        let a: [f64; 12] = [1.0, 4.0, 0.0, 0.0, 2.0, 5.0, 0.0, 0.0, 3.0, 6.0, 0.0, 0.0];
-        let b: [f64; 12] = [1.0, 2.0, 0.0, 0.0, 3.0, 4.0, 0.0, 0.0, 5.0, 6.0, 0.0, 0.0];
+        let a = [1.0_f64, 4.0, 0.0, 0.0, 2.0, 5.0, 0.0, 0.0, 3.0, 6.0, 0.0, 0.0]
+            .map(TropicalMaxPlus);
+        let b = [1.0_f64, 2.0, 0.0, 0.0, 3.0, 4.0, 0.0, 0.0, 5.0, 6.0, 0.0, 0.0]
+            .map(TropicalMaxPlus);
 
         let mut c = [TropicalMaxPlus::tropical_zero(); 4];
         let mut argmax = [0u32; 4];
@@ -326,8 +332,8 @@ mod tests {
         let nr = 2;
         let k = 2;
 
-        let a: [f64; 8] = [1.0, 2.0, 0.0, 0.0, 10.0, 20.0, 0.0, 0.0];
-        let b: [f64; 8] = [1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0];
+        let a = [1.0_f64, 2.0, 0.0, 0.0, 10.0, 20.0, 0.0, 0.0].map(TropicalMaxPlus);
+        let b = [1.0_f64, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0].map(TropicalMaxPlus);
 
         let mut c = [TropicalMaxPlus::tropical_zero(); 4];
         let mut argmax = [0u32; 4];
@@ -365,8 +371,8 @@ mod tests {
         let nr = 2;
         let k = 2;
 
-        let a: [f32; 8] = [1.0, 2.0, 0.0, 0.0, 3.0, 4.0, 0.0, 0.0];
-        let b: [f32; 8] = [1.0, 2.0, 0.0, 0.0, 3.0, 4.0, 0.0, 0.0];
+        let a = [1.0_f32, 2.0, 0.0, 0.0, 3.0, 4.0, 0.0, 0.0].map(TropicalMaxPlus);
+        let b = [1.0_f32, 2.0, 0.0, 0.0, 3.0, 4.0, 0.0, 0.0].map(TropicalMaxPlus);
 
         let mut c = [TropicalMaxPlus::tropical_zero(); 4];
         let ldc = 2;

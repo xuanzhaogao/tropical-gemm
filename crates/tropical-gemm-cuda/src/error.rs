@@ -26,6 +26,10 @@ pub enum CudaError {
     /// Kernel not found.
     #[error("Kernel not found: {0}")]
     KernelNotFound(String),
+
+    /// Invalid state or CRT invariant violation.
+    #[error("{0}")]
+    InvalidState(String),
 }
 
 /// Result type for CUDA operations.

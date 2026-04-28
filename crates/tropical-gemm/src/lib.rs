@@ -126,9 +126,13 @@
 
 // Internal modules
 pub mod core;
+pub mod crt;
 pub mod mat;
 pub mod simd;
 pub mod types;
+
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 
 mod api;
 mod backend;
@@ -138,7 +142,7 @@ pub use api::{
     tropical_backward_a, tropical_backward_a_batched, tropical_backward_b,
     tropical_backward_b_batched, tropical_gemm, tropical_matmul, tropical_matmul_batched,
     tropical_matmul_batched_with_argmax, tropical_matmul_strided_batched,
-    tropical_matmul_with_argmax, TropicalGemm,
+    tropical_matmul_t, tropical_matmul_with_argmax, TropicalGemm,
 };
 pub use backend::{version_info, Backend};
 
@@ -147,8 +151,13 @@ pub use core::{GemmWithArgmax, Layout, Transpose};
 pub use mat::{Mat, MatMut, MatRef, MatWithArgmax};
 pub use simd::{simd_level, KernelDispatch, SimdLevel};
 pub use types::{
-    CountingTropical, SimdTropical, TropicalAndOr, TropicalMaxMul, TropicalMaxPlus,
+    CountingTropical, Max, Min, SimdTropical, TropicalAndOr, TropicalMaxMul, TropicalMaxPlus,
     TropicalMinPlus, TropicalScalar, TropicalSemiring, TropicalWithArgmax,
+};
+
+pub use crt::{
+    bound_for_single_matmul, choose_primes, count_ground_states, crt_combine, CountedMat,
+    CRT_PRIMES,
 };
 
 // Convenient type aliases
@@ -167,8 +176,8 @@ pub mod prelude {
         tropical_backward_a, tropical_backward_a_batched, tropical_backward_b,
         tropical_backward_b_batched, tropical_matmul, tropical_matmul_batched,
         tropical_matmul_batched_with_argmax, tropical_matmul_strided_batched,
-        tropical_matmul_with_argmax, AndOr, Backend, CountingTropical, GemmWithArgmax, Mat, MatMut,
-        MatRef, MatWithArgmax, MaxMul, MaxPlus, MinPlus, Transpose, TropicalAndOr, TropicalGemm,
+        tropical_matmul_t, tropical_matmul_with_argmax, AndOr, Backend, CountingTropical, GemmWithArgmax, Mat, MatMut,
+        MatRef, MatWithArgmax, Max, MaxMul, MaxPlus, Min, MinPlus, Transpose, TropicalAndOr, TropicalGemm,
         TropicalMaxMul, TropicalMaxPlus, TropicalMinPlus, TropicalSemiring, TropicalWithArgmax,
     };
 }

@@ -17,11 +17,15 @@ impl Microkernel<TropicalMaxPlus<f32>> for NeonMaxPlusF32Kernel {
         mr: usize,
         nr: usize,
         k: usize,
-        a: *const f32,
-        b: *const f32,
+        a: *const TropicalMaxPlus<f32>,
+        b: *const TropicalMaxPlus<f32>,
         c: *mut TropicalMaxPlus<f32>,
         ldc: usize,
     ) {
+        // Safety: TropicalMaxPlus<f32> is repr(transparent) over f32
+        let a = a as *const f32;
+        let b = b as *const f32;
+
         let neg_inf = f32x4::splat(f32::NEG_INFINITY);
         let mut acc = [neg_inf; 4];
 
@@ -77,11 +81,15 @@ impl Microkernel<TropicalMaxPlus<f64>> for NeonMaxPlusF64Kernel {
         mr: usize,
         nr: usize,
         k: usize,
-        a: *const f64,
-        b: *const f64,
+        a: *const TropicalMaxPlus<f64>,
+        b: *const TropicalMaxPlus<f64>,
         c: *mut TropicalMaxPlus<f64>,
         ldc: usize,
     ) {
+        // Safety: TropicalMaxPlus<f64> is repr(transparent) over f64
+        let a = a as *const f64;
+        let b = b as *const f64;
+
         let neg_inf = f64x2::splat(f64::NEG_INFINITY);
         let mut acc = [neg_inf; 2];
 
@@ -137,11 +145,15 @@ impl Microkernel<TropicalMinPlus<f32>> for NeonMinPlusF32Kernel {
         mr: usize,
         nr: usize,
         k: usize,
-        a: *const f32,
-        b: *const f32,
+        a: *const TropicalMinPlus<f32>,
+        b: *const TropicalMinPlus<f32>,
         c: *mut TropicalMinPlus<f32>,
         ldc: usize,
     ) {
+        // Safety: TropicalMinPlus<f32> is repr(transparent) over f32
+        let a = a as *const f32;
+        let b = b as *const f32;
+
         let pos_inf = f32x4::splat(f32::INFINITY);
         let mut acc = [pos_inf; 4];
 

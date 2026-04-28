@@ -10,7 +10,7 @@ use super::{Mat, MatRef};
 // MatRef * MatRef
 impl<'a, 'b, S> Mul<&'b MatRef<'b, S>> for &'a MatRef<'a, S>
 where
-    S: TropicalSemiring + KernelDispatch,
+    S: TropicalSemiring + KernelDispatch + Default,
 {
     type Output = Mat<S>;
 
@@ -22,7 +22,7 @@ where
 // MatRef * MatRef (by value, since MatRef is Copy)
 impl<'a, 'b, S> Mul<MatRef<'b, S>> for MatRef<'a, S>
 where
-    S: TropicalSemiring + KernelDispatch,
+    S: TropicalSemiring + KernelDispatch + Default,
 {
     type Output = Mat<S>;
 
@@ -34,8 +34,7 @@ where
 // &Mat * &MatRef
 impl<'a, S> Mul<&'a MatRef<'a, S>> for &Mat<S>
 where
-    S: TropicalSemiring + KernelDispatch,
-    S::Scalar: Copy,
+    S: TropicalSemiring + KernelDispatch + Default,
 {
     type Output = Mat<S>;
 
@@ -47,8 +46,7 @@ where
 // &Mat * &Mat
 impl<S> Mul<&Mat<S>> for &Mat<S>
 where
-    S: TropicalSemiring + KernelDispatch,
-    S::Scalar: Copy,
+    S: TropicalSemiring + KernelDispatch + Default,
 {
     type Output = Mat<S>;
 
@@ -60,8 +58,7 @@ where
 // Mat * Mat (consuming)
 impl<S> Mul<Mat<S>> for Mat<S>
 where
-    S: TropicalSemiring + KernelDispatch,
-    S::Scalar: Copy,
+    S: TropicalSemiring + KernelDispatch + Default,
 {
     type Output = Mat<S>;
 
