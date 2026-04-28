@@ -4,12 +4,15 @@
 //! who want raw per-prime residues — no CRT, no BigInt. Intended for the
 //! Julia GEMM API operating on `Matrix{CountingTropical{T, Mod{P}}}`.
 
+use cudarc::driver::sys::CUdeviceptr;
 use cudarc::driver::{DeviceRepr, ValidAsZeroBits};
 
 use tropical_gemm::types::TropicalDirection;
 
 use crate::context::CudaContext;
-use crate::counting_kernel::{launch_counting_gemm, CountingCudaKernel};
+use crate::counting_kernel::{
+    launch_counting_gemm, launch_counting_gemm_dev_ptr, CountingCudaKernel, DevPtr,
+};
 use crate::error::{CudaError, Result};
 use crate::memory::GpuMatrix;
 use crate::pair::PackPair;
@@ -185,6 +188,72 @@ where
     run_packed::<T, D>(ctx, pair_a, m, k, pair_b, n, p, out_val, out_cnt)
 }
 
+/// Spec L: kernel-only entry point. Caller already owns device buffers
+/// (e.g. CUDA.jl uploaded the pair inputs and pre-allocated the SoA outputs)
+/// and wants Rust to do nothing but launch the kernel.
+///
+/// `pair_a_dev_ptr` and `pair_b_dev_ptr` are raw `CUdeviceptr`s for the
+/// row-major M×K and K×N pair buffers. `out_val_dev_ptr` and
+/// `out_cnt_dev_ptr` are raw `CUdeviceptr`s for the M×N value and count
+/// SoA outputs (T and i32 respectively). All four point into the primary
+/// CUDA context, which both this crate (via cudarc `CudaContext::new`) and
+/// CUDA.jl share.
+///
+/// Validates `2 <= p < 2^31` and `m, k, n > 0`. **Cannot** check buffer
+/// length — caller is responsible for asserting that each pointer
+/// references at least the documented number of elements.
+///
+/// Synchronizes the device before the kernel launch (defensive against
+/// uploads in flight on the caller's stream); see
+/// `CountingCudaKernel::launch_counting_gemm_dev_ptr` for details.
+pub fn matmul_mod_p_kernel_only<T, D>(
+    ctx: &CudaContext,
+    pair_a_dev_ptr: CUdeviceptr,
+    m: usize,
+    k: usize,
+    pair_b_dev_ptr: CUdeviceptr,
+    n: usize,
+    p: i32,
+    out_val_dev_ptr: CUdeviceptr,
+    out_cnt_dev_ptr: CUdeviceptr,
+) -> Result<()>
+where
+    T: tropical_gemm::types::TropicalScalar
+        + DeviceRepr
+        + ValidAsZeroBits
+        + Default
+        + Clone
+        + Copy
+        + PackPair
+        + 'static,
+    D: TropicalDirection,
+    (T, D): CountingCudaKernel<T, D>,
+{
+    if p < P_MIN {
+        return Err(CudaError::InvalidState(format!(
+            "modulus must satisfy {} <= p < 2^31, got {}",
+            P_MIN, p
+        )));
+    }
+    if m == 0 || k == 0 || n == 0 {
+        return Err(CudaError::InvalidState(
+            "dimensions must be non-zero".into(),
+        ));
+    }
+
+    launch_counting_gemm_dev_ptr::<T, D>(
+        ctx,
+        DevPtr(pair_a_dev_ptr),
+        m,
+        k,
+        DevPtr(pair_b_dev_ptr),
+        n,
+        DevPtr(out_val_dev_ptr),
+        DevPtr(out_cnt_dev_ptr),
+        p,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -321,6 +390,110 @@ mod tests {
                 assert_eq!(out_cnt[i*n + j] as i64, acc, "count mismatch at ({},{})", i, j);
             }
         }
+    }
+
+    #[test]
+    fn matmul_mod_p_kernel_only_round_trip_max_p7() {
+        // Spec L: caller-owned device pointers (simulating CUDA.jl). Uploads
+        // via cudarc, extracts raw CUdeviceptr, runs kernel-only path.
+        use cudarc::driver::DevicePtr;
+        use crate::pair::PairF32;
+        let ctx = crate::get_global_context().expect("CUDA ctx");
+
+        let pair_a_host = vec![
+            PairF32::new(1.0, 1), PairF32::new(2.0, 1),
+            PairF32::new(3.0, 1), PairF32::new(4.0, 1),
+        ];
+        let pair_b_host = vec![
+            PairF32::new(5.0, 1), PairF32::new(6.0, 1),
+            PairF32::new(7.0, 1), PairF32::new(8.0, 1),
+        ];
+
+        let pair_a_dev = ctx.device().htod_copy(pair_a_host.clone()).expect("upload A");
+        let pair_b_dev = ctx.device().htod_copy(pair_b_host.clone()).expect("upload B");
+        let out_val_dev = ctx.device().alloc_zeros::<f32>(4).expect("alloc out_val");
+        let out_cnt_dev = ctx.device().alloc_zeros::<i32>(4).expect("alloc out_cnt");
+
+        let a_ptr = *pair_a_dev.device_ptr();
+        let b_ptr = *pair_b_dev.device_ptr();
+        let out_v_ptr = *out_val_dev.device_ptr();
+        let out_c_ptr = *out_cnt_dev.device_ptr();
+
+        matmul_mod_p_kernel_only::<f32, Max>(
+            ctx, a_ptr, 2, 2, b_ptr, 2, 7, out_v_ptr, out_c_ptr,
+        ).expect("kernel-only ok");
+
+        let out_val = ctx.device().dtoh_sync_copy(&out_val_dev).expect("download v");
+        let out_cnt = ctx.device().dtoh_sync_copy(&out_cnt_dev).expect("download c");
+        assert_eq!(out_val, vec![9.0_f32, 10.0, 11.0, 12.0]);
+        assert_eq!(out_cnt, vec![1_i32, 1, 1, 1]);
+    }
+
+    #[test]
+    fn matmul_mod_p_kernel_only_round_trip_min_f64_p11() {
+        use cudarc::driver::DevicePtr;
+        use crate::pair::PairF64;
+        use tropical_gemm::types::Min;
+        let ctx = crate::get_global_context().expect("CUDA ctx");
+
+        let m = 4usize; let k = 6usize; let n = 4usize;
+        let a_val: Vec<f64> = (0..m*k).map(|i| (i % 5) as f64).collect();
+        let a_cnt: Vec<i32> = (0..m*k).map(|i| ((i + 1) % 11) as i32).collect();
+        let b_val: Vec<f64> = (0..k*n).map(|i| (i % 4) as f64).collect();
+        let b_cnt: Vec<i32> = (0..k*n).map(|i| ((i + 2) % 11) as i32).collect();
+
+        let pair_a_host: Vec<PairF64> = a_val.iter().zip(a_cnt.iter())
+            .map(|(&v, &c)| PairF64::new(v, c)).collect();
+        let pair_b_host: Vec<PairF64> = b_val.iter().zip(b_cnt.iter())
+            .map(|(&v, &c)| PairF64::new(v, c)).collect();
+
+        let pair_a_dev = ctx.device().htod_copy(pair_a_host).expect("upload A");
+        let pair_b_dev = ctx.device().htod_copy(pair_b_host).expect("upload B");
+        let out_val_dev = ctx.device().alloc_zeros::<f64>(m * n).expect("alloc out_val");
+        let out_cnt_dev = ctx.device().alloc_zeros::<i32>(m * n).expect("alloc out_cnt");
+
+        matmul_mod_p_kernel_only::<f64, Min>(
+            ctx,
+            *pair_a_dev.device_ptr(), m, k,
+            *pair_b_dev.device_ptr(), n,
+            11,
+            *out_val_dev.device_ptr(),
+            *out_cnt_dev.device_ptr(),
+        ).expect("kernel-only ok");
+
+        let out_val = ctx.device().dtoh_sync_copy(&out_val_dev).expect("download v");
+        let out_cnt = ctx.device().dtoh_sync_copy(&out_cnt_dev).expect("download c");
+
+        // Reference (same as matmul_mod_p_4x4_min_random_p11).
+        for i in 0..m {
+            for j in 0..n {
+                let mut best = f64::INFINITY;
+                let mut acc: i64 = 0;
+                for kk in 0..k {
+                    let v = a_val[i*k + kk] + b_val[kk*n + j];
+                    if v < best {
+                        best = v;
+                        acc = (a_cnt[i*k + kk] as i64) * (b_cnt[kk*n + j] as i64) % 11;
+                    } else if v == best {
+                        acc = (acc + (a_cnt[i*k + kk] as i64) * (b_cnt[kk*n + j] as i64)) % 11;
+                    }
+                }
+                assert_eq!(out_val[i*n + j], best, "value mismatch at ({},{})", i, j);
+                assert_eq!(out_cnt[i*n + j] as i64, acc, "count mismatch at ({},{})", i, j);
+            }
+        }
+    }
+
+    #[test]
+    fn matmul_mod_p_kernel_only_rejects_p_one() {
+        let ctx = crate::get_global_context().expect("CUDA ctx");
+        // Use bogus pointers — validation must happen before we touch them.
+        let err = matmul_mod_p_kernel_only::<f32, Max>(
+            ctx, 0, 2, 2, 0, 2, 1, 0, 0,
+        ).expect_err("p=1 must be rejected");
+        let msg = format!("{}", err);
+        assert!(msg.contains("modulus") || msg.contains("p"),
+            "expected modulus error, got: {}", msg);
     }
 
     #[test]

@@ -16,8 +16,28 @@ use crate::context::{CudaContext, COUNTING_WARPK_K_THRESHOLD, COUNTING_WARPK_MN_
 use crate::error::Result;
 use crate::memory::GpuMatrix;
 use crate::pair::PackPair;
+use cudarc::driver::sys::CUdeviceptr;
 use cudarc::driver::{DeviceRepr, LaunchAsync, LaunchConfig, ValidAsZeroBits};
 use tropical_gemm::types::{Max, Min, TropicalDirection};
+
+/// Wraps a raw `CUdeviceptr` so it can be passed to `kernel.launch(...)` as a
+/// kernel parameter. Used by the kernel-only entry points whose callers
+/// (e.g. CUDA.jl on the Julia side) own the device buffers themselves —
+/// there is no `CudaSlice` to borrow from.
+///
+/// Layout matches what the kernel expects for any pointer-typed argument:
+/// `as_kernel_param` returns a pointer to the inner `CUdeviceptr`, so the
+/// driver dereferences it and pushes the actual device address as the
+/// kernel arg. This is the same pattern `&CudaSlice<T>` uses internally.
+#[derive(Copy, Clone, Debug)]
+pub struct DevPtr(pub CUdeviceptr);
+
+unsafe impl DeviceRepr for DevPtr {
+    #[inline(always)]
+    fn as_kernel_param(&self) -> *mut std::ffi::c_void {
+        (&self.0) as *const CUdeviceptr as *mut std::ffi::c_void
+    }
+}
 
 pub trait CountingCudaKernel<T, D>
 where
@@ -103,6 +123,93 @@ where
                     pair_b.as_slice(),
                     value_c.as_slice_mut(),
                     count_c.as_slice_mut(),
+                    m as i32,
+                    n as i32,
+                    k as i32,
+                    modulus,
+                    mu,
+                ),
+            )?;
+        }
+
+        ctx.device().synchronize()?;
+        Ok(())
+    }
+
+    /// Kernel-only launch. Identical kernel + dispatch to
+    /// `launch_counting_gemm`, but takes raw device pointers (`DevPtr`) for
+    /// the four data buffers instead of `&GpuMatrix<...>`. Used by callers
+    /// who own their device memory (e.g. CUDA.jl); Rust performs no
+    /// allocation, no upload, and no download.
+    ///
+    /// # Stream coordination
+    ///
+    /// Calls `ctx.device().synchronize()` *before* the kernel launch so that
+    /// any prior work on other streams (e.g. CUDA.jl's task-local stream
+    /// just used to upload `pair_a` / `pair_b`) is fully complete. Required
+    /// because cudarc launches on its own stream — without this barrier,
+    /// the kernel can race uploads issued from the Julia side.
+    ///
+    /// # Safety contract
+    ///
+    /// Caller is responsible for asserting that:
+    /// - `pair_a_dev` points to at least `m * k` `<T as PackPair>::Pair` elements,
+    /// - `pair_b_dev` points to at least `k * n` `<T as PackPair>::Pair` elements,
+    /// - `out_val_dev` and `out_cnt_dev` each point to at least `m * n` elements
+    ///   of `T` and `i32` respectively,
+    /// - all four pointers are valid in the primary CUDA context.
+    ///
+    /// Buffer-length validation is impossible from raw pointers alone.
+    fn launch_counting_gemm_dev_ptr(
+        ctx: &CudaContext,
+        pair_a_dev: DevPtr,
+        m: usize,
+        k: usize,
+        pair_b_dev: DevPtr,
+        n: usize,
+        out_val_dev: DevPtr,
+        out_cnt_dev: DevPtr,
+        modulus: i32,
+    ) -> Result<()> {
+        // Sync *before* the launch: cudarc launches on its own stream, while
+        // the caller (CUDA.jl) may have just enqueued uploads on its
+        // task-local stream. A device-wide barrier here ensures those
+        // uploads are visible to the kernel.
+        ctx.device().synchronize()?;
+
+        let use_warpk = k >= COUNTING_WARPK_K_THRESHOLD
+            && m.saturating_mul(n) <= COUNTING_WARPK_MN_CEILING;
+        let kernel_name = if use_warpk {
+            Self::KERNEL_NAME_WARPK
+        } else {
+            Self::KERNEL_NAME
+        };
+        let kernel = ctx.get_kernel(kernel_name)?;
+        let (grid_dim, block_dim) = if use_warpk {
+            Self::launch_dims_warpk(m, n)
+        } else {
+            Self::launch_dims(m, n)
+        };
+        let cfg = LaunchConfig {
+            grid_dim,
+            block_dim,
+            shared_mem_bytes: 0,
+        };
+
+        let mu: u64 = if modulus > 1 {
+            ((1u128 << 64) / modulus as u128) as u64
+        } else {
+            0
+        };
+
+        unsafe {
+            kernel.launch(
+                cfg,
+                (
+                    pair_a_dev,
+                    pair_b_dev,
+                    out_val_dev,
+                    out_cnt_dev,
                     m as i32,
                     n as i32,
                     k as i32,
@@ -245,6 +352,27 @@ where
 {
     <(T, D) as CountingCudaKernel<T, D>>::launch_counting_gemm(
         ctx, pair_a, pair_b, value_c, count_c, modulus,
+    )
+}
+
+pub fn launch_counting_gemm_dev_ptr<T, D>(
+    ctx: &CudaContext,
+    pair_a_dev: DevPtr,
+    m: usize,
+    k: usize,
+    pair_b_dev: DevPtr,
+    n: usize,
+    out_val_dev: DevPtr,
+    out_cnt_dev: DevPtr,
+    modulus: i32,
+) -> Result<()>
+where
+    T: DeviceRepr + ValidAsZeroBits + Default + Clone + Copy + PackPair + 'static,
+    D: TropicalDirection,
+    (T, D): CountingCudaKernel<T, D>,
+{
+    <(T, D) as CountingCudaKernel<T, D>>::launch_counting_gemm_dev_ptr(
+        ctx, pair_a_dev, m, k, pair_b_dev, n, out_val_dev, out_cnt_dev, modulus,
     )
 }
 
