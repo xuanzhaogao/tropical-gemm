@@ -85,4 +85,40 @@ end
         @test_throws DimensionMismatch count_ground_states_gpu_u64(
             Max, A, B, UInt64(8))
     end
+
+    @testset "TropicalMatrix * TropicalMatrix (Max, f32)" begin
+        A = Float32.(rand(0:3, 8, 13))
+        B = Float32.(rand(0:3, 13, 9))
+        ref_v, ref_c = reference(Max, A, B)
+        TA = TropicalMatrix(Max, A)
+        TB = TropicalMatrix(Max, B)
+        @test size(TA) == (8, 13)
+        @test TA[1, 1] == A[1, 1]
+        res = TA * TB
+        @test res.values == ref_v
+        @test res.counts == ref_c
+    end
+
+    @testset "TropicalMatrix * TropicalMatrix (Min, f64)" begin
+        A = Float64.(rand(0:4, 6, 11))
+        B = Float64.(rand(0:4, 11, 7))
+        ref_v, ref_c = reference(Min, A, B)
+        res = TropicalMatrix(Min, A) * TropicalMatrix(Min, B)
+        @test res.values == ref_v
+        @test res.counts == ref_c
+    end
+
+    @testset "TropicalMatrix direction mismatch" begin
+        A = TropicalMatrix(Max, Float32[1 2; 3 4])
+        B = TropicalMatrix(Min, Float32[5 6; 7 8])
+        @test_throws ArgumentError A * B
+    end
+
+    @testset "TropicalMatrix custom bound" begin
+        A = TropicalMatrix(Max, Float32[1 2; 3 4]; bound = 2)
+        B = TropicalMatrix(Max, Float32[5 6; 7 8])
+        res = A * B
+        @test res.values == Float32[9 10; 11 12]
+        @test res.counts == UInt64[1 1; 1 1]
+    end
 end
