@@ -22,6 +22,7 @@ res.counts  # 64×64 Matrix{UInt64} : count of ground states per cell
 """
 module CountingTropicalGEMM
 
+using CUDA
 using Libdl
 using LinearAlgebra
 
@@ -30,6 +31,7 @@ export count_ground_states_gpu_u64, bench_kernel_only_u64
 export CountingTropicalGEMMError, BoundTooLargeError
 export ModCountingTropical, ModCountingTropicalMin
 export tropical_matmul, tropical_matmul_min
+export tropical_matmul_dev, tropical_matmul_dev_min, cuda_pair_buffer
 
 # ---------------------------------------------------------------------------
 # Direction tags. Match the Rust `Max` / `Min` marker types.
@@ -108,6 +110,15 @@ end
 
 function __init__()
     LIB_PATH[] = _resolve_library()
+    # CUDA.jl + cudarc interop note: both runtimes target the same CUDA
+    # *primary* context (cudarc retains it via cuDevicePrimaryCtxRetain;
+    # CUDA.jl uses the same context by default), so device pointers are
+    # interchangeable across the two runtimes. However, if CUDA.jl loads
+    # its bundled forward-compat libcuda artifact (newer than the host
+    # kernel module), cudarc's `cuInit(0)` fails with
+    # CUDA_ERROR_OPERATING_SYSTEM. If you see that error, set
+    # `ENV["JULIA_CUDA_USE_COMPAT"] = "false"` *before* `using CUDA` so the
+    # process opens the system libcuda that matches the kernel driver.
 end
 
 function _libpath()::String
@@ -543,6 +554,11 @@ end
 
 # Internal core. Both public entries call this with their CT and dir Val.
 # E is the concrete element type CT{T, P}.
+#
+# Spec L: routes through CUDA.jl + the device-pointer Rust ABI. Pack into a
+# row-major Vector{PairT} host-side, upload to a CuVector via CUDA.jl,
+# call tropical_matmul_dev[_min], download the SoA outputs, zip back into
+# a Matrix{E}. Device memory is owned by Julia throughout.
 function _tropical_matmul_core(::Type{E}, dir_val::Val,
                                A::AbstractMatrix{E},
                                B::AbstractMatrix{E}
@@ -554,21 +570,20 @@ function _tropical_matmul_core(::Type{E}, dir_val::Val,
         "A is $(size(A)) but B is $(size(B)); inner dims must match"))
     _check_mod_p(P)
 
-    pair_a = _row_major_pair(A)
-    pair_b = _row_major_pair(B)
-    out_val = Vector{T}(undef, m * n)
-    out_cnt = Vector{Int32}(undef, m * n)
+    PT = _pair_type(T)
+    _ensure_cuda_jl_context()
 
-    _check_version()
-    code = _tg_mod_pair_ccall(dir_val, T,
-        pair_a, Csize_t(m), Csize_t(k),
-        pair_b, Csize_t(n),
-        Int32(P),
-        out_val, out_cnt)
-    if code != Int32(0)
-        _throw_for(Int32(code))
-    end
+    # Pack host row-major buffers, upload to GPU.
+    pair_a_dev = CuArray(_row_major_pair(A))::CuVector{PT}
+    pair_b_dev = CuArray(_row_major_pair(B))::CuVector{PT}
 
+    # Device-to-device matmul (no Rust allocation, no Rust copy).
+    out_val_dev, out_cnt_dev = _tropical_matmul_dev_core(
+        T, PT, dir_val, pair_a_dev, m, k, pair_b_dev, n, P)
+
+    # Download and zip into the user-visible Matrix{E}.
+    out_val = Array(out_val_dev)
+    out_cnt = Array(out_cnt_dev)
     return _zip_to_modct(E, out_val, out_cnt, m, n)
 end
 
@@ -655,5 +670,144 @@ Base.convert(::Type{ModCountingTropical{T, P}},
 Base.convert(::Type{ModCountingTropicalMin{T, P}},
              x::CountingTropicalMin{T, Mod{P}}) where {T <: Union{Float32, Float64}, P} =
     ModCountingTropicalMin{T, P}(x.n, Int32(_mod_value(x.c)))
+
+# ---------------------------------------------------------------------------
+# Spec L: device-pointer matmul. Caller owns device memory through CUDA.jl;
+# Rust side never allocates or copies. Cudarc's CudaContext::new retains the
+# CUDA *primary* context, which CUDA.jl also uses by default — so device
+# pointers are interchangeable across the two runtimes.
+#
+# Stream coordination: the Rust kernel-only entry (matmul_mod_p_kernel_only)
+# calls `cuCtxSynchronize` before the kernel launch, which blocks until any
+# uploads enqueued from CUDA.jl on its task-local stream have completed.
+# That makes it safe to call `tropical_matmul_dev` immediately after a
+# `CuArray` upload without explicit synchronization on the Julia side.
+# ---------------------------------------------------------------------------
+
+# Ensure CUDA.jl has retained the primary context before the first ccall —
+# otherwise cudarc would be the first to retain it and CUDA.jl device-pointer
+# interop becomes order-sensitive. CUDA.context() is the canonical retain.
+function _ensure_cuda_jl_context()
+    # `CUDA.context()` lazily attaches a context to the current task. After
+    # the first call, the device pointers we hand to Rust are guaranteed to
+    # live in the same primary context cudarc retains.
+    CUDA.context()
+    return nothing
+end
+
+"""
+    cuda_pair_buffer(A::AbstractMatrix{ModCountingTropical{T, P}}) -> CuVector{PairT}
+    cuda_pair_buffer(A::AbstractMatrix{ModCountingTropicalMin{T, P}}) -> CuVector{PairT}
+
+Materialize a row-major `Vector{PairT}` from a column-major
+`Matrix{ModCountingTropical[Min]{T, P}}` and upload it to the GPU.
+Returns a `CuVector` whose underlying bytes are exactly what the kernel
+expects for an M×K (or K×N) input. Use this to prepare inputs for
+`tropical_matmul_dev` / `tropical_matmul_dev_min`.
+
+`PairT` is `PairF32` for `T == Float32` and `PairF64` for `T == Float64`.
+"""
+function cuda_pair_buffer(A::AbstractMatrix{<:Union{
+        ModCountingTropical{T, P},
+        ModCountingTropicalMin{T, P}
+    }}) where {T <: Union{Float32, Float64}, P}
+    _ensure_cuda_jl_context()
+    return CuArray(_row_major_pair(A))
+end
+
+# Per-(T, dir) ccall thunk for the device-pointer C ABI. The four extern fns
+# differ only in symbol; we generate one method per (T, dir) via @eval.
+function _tg_mod_pair_dev_ccall end
+
+for (T, sym_max, sym_min) in (
+    (Float32, :tg_matmul_mod_p_pair_dev_f32_max, :tg_matmul_mod_p_pair_dev_f32_min),
+    (Float64, :tg_matmul_mod_p_pair_dev_f64_max, :tg_matmul_mod_p_pair_dev_f64_min),
+)
+    for (dir_val, sym) in ((:(Val{:max}), sym_max), (:(Val{:min}), sym_min))
+        @eval function _tg_mod_pair_dev_ccall(::$dir_val, ::Type{$T},
+                                              pair_a_dev::UInt64, m::Csize_t, k::Csize_t,
+                                              pair_b_dev::UInt64, n::Csize_t,
+                                              p::Int32,
+                                              out_val_dev::UInt64,
+                                              out_cnt_dev::UInt64)
+            ccall(($(QuoteNode(sym)), _libpath()), Cint,
+                  (UInt64, Csize_t, Csize_t,
+                   UInt64, Csize_t,
+                   Int32,
+                   UInt64, UInt64),
+                  pair_a_dev, m, k,
+                  pair_b_dev, n,
+                  p,
+                  out_val_dev, out_cnt_dev)
+        end
+    end
+end
+
+# Internal core for tropical_matmul_dev[_min]. PT is PairF32 or PairF64.
+function _tropical_matmul_dev_core(::Type{T}, ::Type{PT}, dir_val::Val,
+                                   pair_a::CuVector{PT}, m::Integer, k::Integer,
+                                   pair_b::CuVector{PT}, n::Integer,
+                                   p::Integer
+                                  ) where {T <: Union{Float32, Float64}, PT}
+    _check_mod_p(p)
+    m, k, n = Int(m), Int(k), Int(n)
+    length(pair_a) == m * k || throw(DimensionMismatch(
+        "pair_a has length $(length(pair_a)) but m*k = $(m*k)"))
+    length(pair_b) == k * n || throw(DimensionMismatch(
+        "pair_b has length $(length(pair_b)) but k*n = $(k*n)"))
+
+    _ensure_cuda_jl_context()
+    out_val = CuArray{T}(undef, m * n)
+    out_cnt = CuArray{Int32}(undef, m * n)
+
+    a_ptr = UInt64(UInt(pointer(pair_a)))
+    b_ptr = UInt64(UInt(pointer(pair_b)))
+    ov_ptr = UInt64(UInt(pointer(out_val)))
+    oc_ptr = UInt64(UInt(pointer(out_cnt)))
+
+    _check_version()
+    code = _tg_mod_pair_dev_ccall(dir_val, T,
+        a_ptr, Csize_t(m), Csize_t(k),
+        b_ptr, Csize_t(n),
+        Int32(p),
+        ov_ptr, oc_ptr)
+    if code != Int32(0)
+        _throw_for(Int32(code))
+    end
+    return (out_val, out_cnt)
+end
+
+"""
+    tropical_matmul_dev(pair_a::CuVector{PairF32|PairF64}, m, k,
+                        pair_b::CuVector{PairF32|PairF64}, n, p)
+        -> (out_val::CuVector{T}, out_cnt::CuVector{Int32})
+
+Device-to-device max-plus mod-`P` counting tropical matmul. `pair_a` is
+the row-major `M × K` pair buffer on the GPU; `pair_b` is row-major
+`K × N`. `p` is the modulus (`2 ≤ p < 2^31`). Output is SoA on the GPU:
+flat row-major value vector (`Float32` or `Float64`) and count vector
+(`Int32`), each of length `m * n`.
+
+Caller is responsible for the row-major byte layout — use
+`cuda_pair_buffer` to produce one from a column-major host matrix.
+"""
+tropical_matmul_dev(pair_a::CuVector{PairF32}, m::Integer, k::Integer,
+                    pair_b::CuVector{PairF32}, n::Integer, p::Integer) =
+    _tropical_matmul_dev_core(Float32, PairF32, Val(:max), pair_a, m, k, pair_b, n, p)
+tropical_matmul_dev(pair_a::CuVector{PairF64}, m::Integer, k::Integer,
+                    pair_b::CuVector{PairF64}, n::Integer, p::Integer) =
+    _tropical_matmul_dev_core(Float64, PairF64, Val(:max), pair_a, m, k, pair_b, n, p)
+
+"""
+    tropical_matmul_dev_min(pair_a, m, k, pair_b, n, p) -> (out_val, out_cnt)
+
+Min-plus counterpart of `tropical_matmul_dev`.
+"""
+tropical_matmul_dev_min(pair_a::CuVector{PairF32}, m::Integer, k::Integer,
+                        pair_b::CuVector{PairF32}, n::Integer, p::Integer) =
+    _tropical_matmul_dev_core(Float32, PairF32, Val(:min), pair_a, m, k, pair_b, n, p)
+tropical_matmul_dev_min(pair_a::CuVector{PairF64}, m::Integer, k::Integer,
+                        pair_b::CuVector{PairF64}, n::Integer, p::Integer) =
+    _tropical_matmul_dev_core(Float64, PairF64, Val(:min), pair_a, m, k, pair_b, n, p)
 
 end # module

@@ -1,3 +1,12 @@
+# Spec L: cudarc and CUDA.jl share the primary CUDA context, but if
+# CUDA.jl loads its bundled forward-compat libcuda artifact (newer than the
+# host kernel module), cudarc's cuInit fails with
+# CUDA_ERROR_OPERATING_SYSTEM. Set this env var *before* CUDA.jl loads to
+# force the process to open the system libcuda that matches the kernel
+# driver. Must precede any code path that imports CUDA (transitively
+# CountingTropicalGEMM does).
+get!(ENV, "JULIA_CUDA_USE_COMPAT", "false")
+
 using Test
 using Random
 using CountingTropicalGEMM
@@ -350,5 +359,69 @@ end
         # assert the converter rejects a deliberately-crafted bad value.
         # (Skipped — Mod{P} invariant guarantees the value fits, so the
         # converter is total within its domain.)
+    end
+
+    @testset "Spec L: device-pointer matmul" begin
+        using CUDA
+        # Same hand-checkable 2x2 example as the f32 Max small testset, but
+        # entered through the CUDA.jl-owned device path.
+        P = 7
+        A = ModCountingTropical{Float32, P}[
+            ModCountingTropical{Float32, P}(1.0f0, Int32(1))  ModCountingTropical{Float32, P}(2.0f0, Int32(1));
+            ModCountingTropical{Float32, P}(3.0f0, Int32(1))  ModCountingTropical{Float32, P}(4.0f0, Int32(1))
+        ]
+        B = ModCountingTropical{Float32, P}[
+            ModCountingTropical{Float32, P}(5.0f0, Int32(1))  ModCountingTropical{Float32, P}(6.0f0, Int32(1));
+            ModCountingTropical{Float32, P}(7.0f0, Int32(1))  ModCountingTropical{Float32, P}(8.0f0, Int32(1))
+        ]
+
+        pa = cuda_pair_buffer(A)
+        pb = cuda_pair_buffer(B)
+        @test pa isa CuVector
+        @test pb isa CuVector
+        @test length(pa) == 4
+        @test length(pb) == 4
+
+        out_val_dev, out_cnt_dev = tropical_matmul_dev(pa, 2, 2, pb, 2, P)
+        @test out_val_dev isa CuVector{Float32}
+        @test out_cnt_dev isa CuVector{Int32}
+
+        out_val = Array(out_val_dev)
+        out_cnt = Array(out_cnt_dev)
+        # Row-major output: [9 10; 11 12], counts all 1.
+        @test out_val == Float32[9, 10, 11, 12]
+        @test out_cnt == Int32[1, 1, 1, 1]
+
+        # Min direction smoke.
+        Am = [ModCountingTropicalMin{Float32, P}(A[i,j].n, A[i,j].c) for i in 1:2, j in 1:2]
+        Bm = [ModCountingTropicalMin{Float32, P}(B[i,j].n, B[i,j].c) for i in 1:2, j in 1:2]
+        pam = cuda_pair_buffer(Am); pbm = cuda_pair_buffer(Bm)
+        ovm_dev, ocm_dev = tropical_matmul_dev_min(pam, 2, 2, pbm, 2, P)
+        # Min: C[1,1] = min(1+5, 2+7) = 6, etc.
+        @test Array(ovm_dev) == Float32[6, 7, 8, 9]
+        @test Array(ocm_dev) == Int32[1, 1, 1, 1]
+
+        # Float64 device path.
+        P2 = 11
+        Af = [ModCountingTropical{Float64, P2}(Float64((i-1)*2 + j), Int32(1))
+              for i in 1:3, j in 1:4]
+        Bf = [ModCountingTropical{Float64, P2}(Float64((i-1)*5 + j), Int32(1))
+              for i in 1:4, j in 1:2]
+        paf = cuda_pair_buffer(Af); pbf = cuda_pair_buffer(Bf)
+        ovf_dev, ocf_dev = tropical_matmul_dev(paf, 3, 4, pbf, 2, P2)
+        # Cross-check against host path (which now also goes through CUDA.jl).
+        ref = tropical_matmul(Af, Bf)
+        ovf = reshape(Array(ovf_dev), 2, 3) |> transpose |> Matrix
+        ocf = reshape(Array(ocf_dev), 2, 3) |> transpose |> Matrix
+        for i in 1:3, j in 1:2
+            @test ovf[i,j] == ref[i,j].n
+            @test ocf[i,j] == ref[i,j].c
+        end
+
+        # Dimension validation.
+        @test_throws DimensionMismatch tropical_matmul_dev(pa, 3, 2, pb, 2, P)
+
+        # Modulus validation.
+        @test_throws ArgumentError tropical_matmul_dev(pa, 2, 2, pb, 2, 1)
     end
 end

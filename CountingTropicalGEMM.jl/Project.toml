@@ -1,20 +1,23 @@
+authors = ["Xuanzhao Gao <xgao@flatironinstitute.org>"]
 name = "CountingTropicalGEMM"
 uuid = "3f1a8e2b-7d9c-4e5a-9f3b-2c8a1b6d4e7f"
-authors = ["Xuanzhao Gao <xgao@flatironinstitute.org>"]
 version = "0.1.0"
 
+[compat]
+CUDA = "5"
+Mods = "2"
+TropicalNumbers = "0.6"
+julia = "1.10"
+
 [deps]
+CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
 Libdl = "8f399da3-3557-5675-b5ff-fb832c97cbdb"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 Mods = "7475f97c-0381-53b1-977b-4c60186c8d62"
 TropicalNumbers = "b3a74e9c-7526-4576-a4eb-79c0d4c32334"
 
-[compat]
-Mods = "2"
-TropicalNumbers = "0.6"
-julia = "1.10"
-
 [extras]
+CUDA_Runtime_jll = "76a88914-d11a-5bdc-97e0-2f5a05c973a2"
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
