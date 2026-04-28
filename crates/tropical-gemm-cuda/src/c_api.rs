@@ -89,7 +89,6 @@ where
         + 'static,
     D: tropical_gemm::types::TropicalDirection,
     (T, D): crate::counting_kernel::TropicalMatmulKernelName<T, D>,
-    (T, D): crate::counting_kernel::CountingCudaKernel<T, D>,
 {
     let tA_char = tA as u8 as char;
     let tB_char = tB as u8 as char;
