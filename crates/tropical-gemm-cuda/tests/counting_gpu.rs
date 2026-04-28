@@ -288,6 +288,35 @@ fn ones_non_aligned_dims_f64() {
 }
 
 #[test]
+fn warpk_transposed_b_layout() {
+    // Spec H: warpk dispatch uploads B in transposed (N×K row-major) layout.
+    // Use deliberately asymmetric values so the host transpose helper would
+    // visibly corrupt the output if rows/cols were swapped wrong.
+    let ctx = CudaContext::new().unwrap();
+    let (m, k, n) = (8, 128, 8); // M*N=64 -> warpk; K=128 -> warpk threshold
+    // A[i,k] = i*1000 + k; B[k,j] = k*100 + j*7. Distinguishable patterns.
+    let a: Vec<f32> = (0..m * k)
+        .map(|idx| {
+            let i = idx / k;
+            let kv = idx % k;
+            (i * 1000 + kv) as f32
+        })
+        .collect();
+    let b: Vec<f32> = (0..k * n)
+        .map(|idx| {
+            let kv = idx / n;
+            let j = idx % n;
+            (kv * 100 + j * 7) as f32
+        })
+        .collect();
+    let bound = bound_for_single_matmul(k);
+    let cpu = count_ground_states::<f32, Max>(&a, m, k, &b, n, &bound);
+    let gpu = count_ground_states_gpu::<f32, Max>(&ctx, &a, m, k, &b, n, &bound).unwrap();
+    assert_eq!(gpu.values, cpu.values, "transposed-B path corrupted values");
+    assert_eq!(gpu.counts, cpu.counts, "transposed-B path corrupted counts");
+}
+
+#[test]
 fn ones_all_ties_large_k_warpk() {
     // K=200 forces warpk path. All inputs equal -> every k contributes the
     // same partial. Output count should be K mod P = 200 (well below P).

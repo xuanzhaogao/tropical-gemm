@@ -140,3 +140,35 @@ Extend `bench_kernel_only.rs` to bench the warpk path at expanded M·N to see wh
 - Fixing AoS warpk (orphaned in production).
 - Changing the naive path (already optimal coalescing).
 - Auto-tuning `COUNTING_WARPK_MN_CEILING` per shape — manual re-tune after measurement.
+
+## Outcome (measured 2026-04-27 on A100-SXM4-80GB)
+
+**Massively above expectations across the entire tested range.** Spec predicted 1.5–2.5×; warpk-ones (transposed B) now wins at every M·N tested up to 1024².
+
+| Shape (K=4096) | naive-ones G/s | warpk-ones (transposed B) G/s | speedup |
+|---|---|---|---|
+| 16² | 8 | 178 | 21.7× |
+| 32² | 33 | 605 | 18.5× |
+| **64² (old ceiling)** | 122 | **1324** | **10.9×** |
+| 96² | 271 | 1610 | 5.95× |
+| **128² (new ceiling)** | 480 | **1903** | **3.96×** |
+| 192² | 1034 | 2097 | 2.03× |
+| 256² | 1384 | 2210 | 1.60× |
+| 512² | 1786 | 2316 | 1.30× |
+| **1024²** | 2031 | **2525** | 1.24× |
+
+Peak warpk-ones throughput hits **2.5 TG/s** at 1024² — beyond the prior MaxPlus reference.
+
+**Dispatch ceiling raised from 64² → 128²** (conservative, accounts for host-side transpose cost on single-prime calls). The kernel itself wins much further out, but the transpose overhead is non-amortized in single-prime calls. Multi-prime CRT calls would profitably use warpk up to ~512²; future on-device transpose would push the threshold higher still.
+
+**Tests:** 17/17 integration green (added `warpk_transposed_b_layout` with deliberately asymmetric A/B values to catch transpose-helper bugs). 56/56 lib green. Total 73/73.
+
+**Files:**
+- `kernels/counting_gemm.cu` — `_warpk_ones` kernels read `value_b_t[j, k]` (N×K row-major) instead of `value_b[k, j]`.
+- `src/crt.rs` — added `transpose_row_major::<T>` host helper; driver branches B upload on `use_warpk`.
+- `src/counting_kernel.rs` — `launch_counting_gemm_ones` now takes M, K, N explicitly (B's `GpuMatrix` shape is layout-dependent).
+- `src/context.rs` — `COUNTING_WARPK_MN_CEILING` raised 4096 → 16384.
+- `tests/counting_gpu.rs` — `warpk_transposed_b_layout` test.
+- `examples/bench_warpk_crossover.rs` — sweep across shape grid to find the new crossover.
+
+**Follow-up suggested by data:** on-device transpose kernel would let `COUNTING_WARPK_MN_CEILING` rise to ~256² or higher and capture the 1.24–1.60× wins at 256–1024² that single-prime calls currently leave on the table.

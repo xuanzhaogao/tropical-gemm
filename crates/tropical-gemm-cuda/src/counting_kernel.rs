@@ -119,23 +119,32 @@ where
     /// Ones-specialized launch (value-only inputs; counts are uniformly 1).
     /// This is the entry point used by `count_ground_states_gpu`. Output is
     /// SoA, same as the AoS path. Same shape-aware naive-vs-warpk dispatch.
+    ///
+    /// `value_b` layout depends on dispatch (caller's responsibility):
+    ///   - naive (`M*N > 64*64`): K × N row-major (B as `B[k,j]`).
+    ///   - warpk (`M*N <= 64*64` && `K >= 64`): N × K row-major (B^T,
+    ///     so lanes load coalesced K-strides).
+    /// `value_a` is always M × K row-major. M, K, N are passed explicitly
+    /// because the `GpuMatrix` shape of `value_b` is layout-dependent.
     fn launch_counting_gemm_ones(
         ctx: &CudaContext,
         value_a: &GpuMatrix<T>,
         value_b: &GpuMatrix<T>,
         value_c: &mut GpuMatrix<T>,
         count_c: &mut GpuMatrix<i32>,
+        m: usize,
+        k: usize,
+        n: usize,
         modulus: i32,
     ) -> Result<()> {
-        let m = value_a.rows();
-        let k = value_a.cols();
-        let n = value_b.cols();
-
-        assert_eq!(value_b.rows(), k);
-        assert_eq!(value_c.rows(), m);
-        assert_eq!(value_c.cols(), n);
-        assert_eq!(count_c.rows(), m);
-        assert_eq!(count_c.cols(), n);
+        debug_assert_eq!(value_a.rows(), m);
+        debug_assert_eq!(value_a.cols(), k);
+        debug_assert_eq!(value_a.rows() * value_a.cols(), m * k);
+        debug_assert_eq!(value_b.rows() * value_b.cols(), k * n);
+        debug_assert_eq!(value_c.rows(), m);
+        debug_assert_eq!(value_c.cols(), n);
+        debug_assert_eq!(count_c.rows(), m);
+        debug_assert_eq!(count_c.cols(), n);
 
         let use_warpk = k >= COUNTING_WARPK_K_THRESHOLD
             && m.saturating_mul(n) <= COUNTING_WARPK_MN_CEILING;
@@ -245,6 +254,9 @@ pub fn launch_counting_gemm_ones<T, D>(
     value_b: &GpuMatrix<T>,
     value_c: &mut GpuMatrix<T>,
     count_c: &mut GpuMatrix<i32>,
+    m: usize,
+    k: usize,
+    n: usize,
     modulus: i32,
 ) -> Result<()>
 where
@@ -253,6 +265,6 @@ where
     (T, D): CountingCudaKernel<T, D>,
 {
     <(T, D) as CountingCudaKernel<T, D>>::launch_counting_gemm_ones(
-        ctx, value_a, value_b, value_c, count_c, modulus,
+        ctx, value_a, value_b, value_c, count_c, m, k, n, modulus,
     )
 }

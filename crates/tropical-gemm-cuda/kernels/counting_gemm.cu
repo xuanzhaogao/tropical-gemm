@@ -201,10 +201,14 @@ COUNTING_GEMM_ONES(counting_gemm_f32_min_ones, float,  POS_INF_F32, MIN_BETTER)
 COUNTING_GEMM_ONES(counting_gemm_f64_max_ones, double, NEG_INF_F64, MAX_BETTER)
 COUNTING_GEMM_ONES(counting_gemm_f64_min_ones, double, POS_INF_F64, MIN_BETTER)
 
+// Spec H: warpk_ones reads B in TRANSPOSED layout (N × K row-major). Lanes
+// share j and stride k by 32, so B^T[j, 32s+lane] is 32 contiguous elements
+// per warp-step → coalesced. Driver uploads the appropriate B layout based
+// on dispatch (transposed for warpk, untransposed for naive).
 #define COUNTING_GEMM_WARPK_ONES(NAME, T, INIT_VAL, BETTER)                    \
 extern "C" __global__ void NAME(                                               \
-    const T* __restrict__ value_a,                                             \
-    const T* __restrict__ value_b,                                             \
+    const T* __restrict__ value_a,    /* M × K row-major  */                   \
+    const T* __restrict__ value_b_t,  /* N × K row-major (transposed) */       \
     T*       __restrict__ value_c, int* __restrict__ count_c,                  \
     int M, int N, int K, int P, unsigned long long MU                          \
 ) {                                                                            \
@@ -217,8 +221,8 @@ extern "C" __global__ void NAME(                                               \
     unsigned int acc_cnt = 0;                                                  \
                                                                                \
     for (int k = lane; k < K; k += 32) {                                       \
-        T va = value_a[OFFSET_ROW(i, k, K)];                                   \
-        T vb = value_b[OFFSET_ROW(k, j, N)];                                   \
+        T va = value_a  [OFFSET_ROW(i, k, K)];                                 \
+        T vb = value_b_t[OFFSET_ROW(j, k, K)];                                 \
         T pv = va + vb;                                                        \
         bool win = BETTER(pv, acc_val);                                        \
         bool tie = (pv == acc_val);                                            \

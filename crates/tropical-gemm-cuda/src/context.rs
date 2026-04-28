@@ -97,12 +97,15 @@ const COUNTING_KERNEL_NAMES: &[&str] = &[
 /// inner loop has too few iterations to amortize the 5-step shuffle reduce.
 pub const COUNTING_WARPK_K_THRESHOLD: usize = 64;
 
-/// Dispatch knob #2: maximum M*N for warpk. Above this, the GPU has enough
-/// independent output cells that the naive (one-thread-per-cell) coalesced-B
-/// pattern outperforms warpk's strided-B pattern. Measured on A100-80GB:
-/// warpk wins ~3-9x at M*N <= 64*64; naive wins >= 128*128. Threshold sits
-/// just below the crossover.
-pub const COUNTING_WARPK_MN_CEILING: usize = 64 * 64;
+/// Dispatch knob #2: maximum M*N for warpk. Re-tuned for Spec H (transposed
+/// B). With coalesced lane loads, warpk's kernel-only time wins across the
+/// entire tested range up to 1024² at K=4096. The bound here accounts for
+/// host-side transpose overhead: the warpk regime requires uploading B in
+/// N×K layout, which costs ~K·N·sizeof(T) host bytes amortized across the
+/// CRT prime loop. At M·N ≤ 128² the kernel speedup dominates the transpose
+/// cost even on single-prime calls. Beyond that, multi-prime calls still
+/// favor warpk but single-prime calls flip; conservative ceiling.
+pub const COUNTING_WARPK_MN_CEILING: usize = 128 * 128;
 
 /// Block height for warpk kernels (number of output rows per block).
 pub const COUNTING_WARPK_ROWS_PER_BLOCK: u32 = 4;

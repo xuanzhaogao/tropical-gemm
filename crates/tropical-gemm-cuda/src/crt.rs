@@ -13,11 +13,26 @@ use tropical_gemm::crt::{choose_primes, crt_combine, CRT_PRIMES};
 use tropical_gemm::types::TropicalDirection;
 use tropical_gemm::CountedMat;
 
-use crate::context::CudaContext;
+use crate::context::{CudaContext, COUNTING_WARPK_K_THRESHOLD, COUNTING_WARPK_MN_CEILING};
 use crate::counting_kernel::{launch_counting_gemm_ones, CountingCudaKernel};
 use crate::error::{CudaError, Result};
 use crate::memory::GpuMatrix;
 use crate::pair::PackPair;
+
+/// Transpose a row-major matrix `(rows × cols)` to row-major `(cols × rows)`.
+/// Used to feed B in `B^T` layout to the warpk kernels (Spec H), which read
+/// it as N × K row-major so that lanes load 32 contiguous K elements per
+/// step (coalesced) instead of N-strided cache lines.
+fn transpose_row_major<T: Copy + Default>(src: &[T], rows: usize, cols: usize) -> Vec<T> {
+    debug_assert_eq!(src.len(), rows * cols);
+    let mut out = vec![T::default(); rows * cols];
+    for r in 0..rows {
+        for c in 0..cols {
+            out[c * rows + r] = src[r * cols + c];
+        }
+    }
+    out
+}
 
 /// GPU version of `tropical_gemm::count_ground_states`. Same semantics,
 /// same caller contract on `count_upper_bound`.
@@ -46,11 +61,24 @@ where
     assert_eq!(b_values.len(), k * n);
 
     // Counts at the entry point are uniformly 1. Use the ones-specialized
-    // kernel: value-only inputs uploaded verbatim (no AoS pack), count
-    // multiply and per-step Barrett dropped (~1.5-2x speedup over the AoS
-    // general kernel; see Spec G).
+    // kernel: value-only inputs (no AoS pack), count multiply and per-step
+    // Barrett dropped (~3x speedup over the AoS general kernel; see Spec G).
+    //
+    // B layout depends on dispatch (Spec H):
+    //   - naive  -> upload B as K × N row-major (lanes share i, vary j,
+    //                  reads B[k,j] coalesced across the warp).
+    //   - warpk  -> upload B as N × K row-major (B^T) so lanes share j,
+    //                  vary k, reads B^T[j,k] coalesced along K.
+    let use_warpk = k >= COUNTING_WARPK_K_THRESHOLD
+        && m.saturating_mul(n) <= COUNTING_WARPK_MN_CEILING;
     let value_a_dev = GpuMatrix::<T>::from_host(ctx, a_values, m, k)?;
-    let value_b_dev = GpuMatrix::<T>::from_host(ctx, b_values, k, n)?;
+    let value_b_dev = if use_warpk {
+        let b_t = transpose_row_major::<T>(b_values, k, n);
+        // Stored as N × K row-major; matches the kernel's `value_b_t` view.
+        GpuMatrix::<T>::from_host(ctx, &b_t, n, k)?
+    } else {
+        GpuMatrix::<T>::from_host(ctx, b_values, k, n)?
+    };
 
     // Output buffers reused across primes. GPU-side zero-init (no host→device
     // upload of zero buffers).
@@ -75,6 +103,7 @@ where
             &value_b_dev,
             &mut value_c,
             &mut count_c,
+            m, k, n,
             p,
         )?;
 
