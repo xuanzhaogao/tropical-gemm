@@ -14,7 +14,7 @@ use tropical_gemm::types::TropicalDirection;
 use tropical_gemm::CountedMat;
 
 use crate::context::CudaContext;
-use crate::counting_kernel::{launch_counting_gemm_aos, CountingCudaKernel};
+use crate::counting_kernel::{launch_counting_gemm, CountingCudaKernel};
 use crate::error::{CudaError, Result};
 use crate::memory::GpuMatrix;
 use crate::pair::PackPair;
@@ -73,7 +73,7 @@ where
     for (i, &prime_idx) in prime_indices.iter().enumerate() {
         let p = CRT_PRIMES[prime_idx];
 
-        launch_counting_gemm_aos::<T, D>(
+        launch_counting_gemm::<T, D>(
             ctx,
             &pair_a,
             &pair_b,
