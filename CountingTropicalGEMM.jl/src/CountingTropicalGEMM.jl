@@ -24,7 +24,7 @@ module CountingTropicalGEMM
 
 using Libdl
 
-export Max, Min, CountedMatU64
+export Max, Min, CountedMatU64, TropicalMatrix
 export count_ground_states_gpu_u64, bench_kernel_only_u64
 export CountingTropicalGEMMError, BoundTooLargeError
 
@@ -253,5 +253,89 @@ for (T, sym_max, sym_min) in (
         end
     end
 end
+
+# ---------------------------------------------------------------------------
+# Standard matmul interface: TropicalMatrix{T,D} * TropicalMatrix{T,D}.
+# Wraps a value matrix with a direction tag (Max/Min) and an implicit
+# all-ones count. `*` dispatches to count_ground_states_gpu_u64 and returns
+# CountedMatU64{T}.
+# ---------------------------------------------------------------------------
+"""
+    TropicalMatrix{T,D}(data; bound = 0)
+    TropicalMatrix(D, data; bound = 0)
+
+Matrix in the (counting) tropical semiring. `D` is `Max` or `Min`,
+`T <: Union{Float32, Float64}`. Input counts are implicitly 1 per cell.
+
+`bound` is the per-cell `count_upper_bound` forwarded to the kernel.
+`bound = 0` (default) auto-selects `K = size(A, 2)` at multiply time —
+the maximum possible count for a single matmul of all-ones counts.
+Override only if you know a tighter or looser envelope is needed.
+"""
+struct TropicalMatrix{T<:Union{Float32,Float64}, D} <: AbstractMatrix{T}
+    data::Matrix{T}
+    bound::UInt64
+end
+
+TropicalMatrix{T,D}(data::Matrix{T}; bound::Integer = 0) where {T,D} =
+    TropicalMatrix{T,D}(data, UInt64(bound))
+
+TropicalMatrix(::Type{D}, data::Matrix{T}; bound::Integer = 0) where {T,D} =
+    TropicalMatrix{T,D}(data, UInt64(bound))
+
+Base.size(M::TropicalMatrix) = size(M.data)
+Base.getindex(M::TropicalMatrix, I::Vararg{Int,N}) where {N} = getindex(M.data, I...)
+Base.IndexStyle(::Type{<:TropicalMatrix}) = IndexLinear()
+Base.getindex(M::TropicalMatrix, i::Int) = getindex(M.data, i)
+
+function Base.:*(A::TropicalMatrix{T,D}, B::TropicalMatrix{T,D}) where {T,D}
+    K = size(A, 2)
+    bound = A.bound == 0 ? UInt64(K) : A.bound
+    count_ground_states_gpu_u64(D, A.data, B.data, bound)
+end
+
+function Base.:*(A::TropicalMatrix{T,DA}, B::TropicalMatrix{T,DB}) where {T,DA,DB}
+    throw(ArgumentError("cannot multiply TropicalMatrix with mismatched directions: $DA vs $DB"))
+end
+
+# ---------------------------------------------------------------------------
+# Min-plus counterpart of TropicalNumbers.jl's CountingTropical.
+# CountingTropical is max-plus; we define a parallel min-plus type so the
+# same FFI driver can serve both directions.
+# ---------------------------------------------------------------------------
+"""
+    CountingTropicalMin{T, CT}(n, c)
+
+Min-plus counting tropical number: `n::T` is the value, `c::CT` is the
+ground-state multiplicity. Semiring operations: `+` takes the smaller
+`n` (sum counts on tie); `*` adds `n` and multiplies counts.
+"""
+struct CountingTropicalMin{T, CT}
+    n::T
+    c::CT
+end
+
+Base.zero(::Type{CountingTropicalMin{T, CT}}) where {T, CT} =
+    CountingTropicalMin{T, CT}(typemax(T), zero(CT))
+Base.one(::Type{CountingTropicalMin{T, CT}}) where {T, CT} =
+    CountingTropicalMin{T, CT}(zero(T), one(CT))
+
+function Base.:+(a::CountingTropicalMin{T, CT}, b::CountingTropicalMin{T, CT}) where {T, CT}
+    if a.n < b.n
+        a
+    elseif b.n < a.n
+        b
+    else
+        CountingTropicalMin{T, CT}(a.n, a.c + b.c)
+    end
+end
+
+Base.:*(a::CountingTropicalMin{T, CT}, b::CountingTropicalMin{T, CT}) where {T, CT} =
+    CountingTropicalMin{T, CT}(a.n + b.n, a.c * b.c)
+
+Base.:(==)(a::CountingTropicalMin, b::CountingTropicalMin) =
+    a.n == b.n && a.c == b.c
+
+export CountingTropicalMin
 
 end # module
