@@ -28,6 +28,7 @@ export Max, Min, CountedMatU64, TropicalMatrix
 export count_ground_states_gpu_u64, bench_kernel_only_u64
 export CountingTropicalGEMMError, BoundTooLargeError
 export ModCountingTropical, ModCountingTropicalMin
+export tropical_matmul, tropical_matmul_min
 
 # ---------------------------------------------------------------------------
 # Direction tags. Match the Rust `Max` / `Min` marker types.
@@ -438,5 +439,151 @@ end
 
 Base.:(==)(a::ModCountingTropicalMin, b::ModCountingTropicalMin) =
     a.n == b.n && a.c == b.c
+
+# ---------------------------------------------------------------------------
+# Spec K Task 7: tropical_matmul / tropical_matmul_min on ModCountingTropical*.
+# Uses the fast-path C ABI: input matrices are reinterpreted as Matrix{PairT}
+# (zero per-element copy — the byte layout already matches), then transposed
+# into a row-major Vector{PairT} buffer and shipped to the GPU. Output is SoA
+# (Vector{T}, Vector{Int32}); we zip back into a column-major matrix of the
+# input type.
+# ---------------------------------------------------------------------------
+
+# Validate P is in the i32 positive range required by the kernel.
+@inline function _check_mod_p(p::Integer)
+    if !(2 <= p < (Int64(1) << 31))
+        throw(ArgumentError(
+            "modulus P must satisfy 2 <= P < 2^31, got $p"))
+    end
+end
+
+# Build a row-major Vector{PairT} from a column-major Julia matrix of
+# ModCountingTropical{T, P} (or its Min variant). Reinterprets first
+# (zero per-element work), then transposes into a fresh row-major buffer.
+function _row_major_pair(A::AbstractMatrix{<:Union{
+        ModCountingTropical{T, P},
+        ModCountingTropicalMin{T, P}
+    }}) where {T <: Union{Float32, Float64}, P}
+    PT = _pair_type(T)
+    rows, cols = size(A)
+    # Build a row-major Vector{PT} directly from the matrix elements.
+    # Constructing each PT explicitly avoids reinterpret's strict padding
+    # check (PairF64 has an explicit `_pad` field that Julia treats as
+    # initialized memory, while ModCountingTropical's trailing alignment
+    # bytes are considered padding). Layout-wise the result is identical
+    # to a transposed reinterpret.
+    buf = Vector{PT}(undef, rows * cols)
+    if PT === PairF32
+        @inbounds for i in 1:rows, j in 1:cols
+            e = A[i, j]
+            buf[(i - 1) * cols + j] = PairF32(e.n, e.c)
+        end
+    else
+        @inbounds for i in 1:rows, j in 1:cols
+            e = A[i, j]
+            buf[(i - 1) * cols + j] = PairF64(e.n, e.c, Int32(0))
+        end
+    end
+    return buf
+end
+
+# Zip flat row-major (out_val, out_cnt) back into a column-major
+# Matrix{E} where E = ModCT{T, P} (or Min variant).
+function _zip_to_modct(::Type{E}, out_val::Vector{T}, out_cnt::Vector{Int32},
+                      rows::Int, cols::Int) where {E, T <: Union{Float32, Float64}}
+    out = Matrix{E}(undef, rows, cols)
+    @inbounds for i in 1:rows, j in 1:cols
+        idx = (i - 1) * cols + j
+        out[i, j] = E(out_val[idx], out_cnt[idx])
+    end
+    return out
+end
+
+# Per-(T, dir) ccall thunk. ccall requires literal symbol/library, so we
+# generate one method per combination via @eval below.
+function _tg_mod_pair_ccall end
+
+for (T, sym_max, sym_min) in (
+    (Float32, :tg_matmul_mod_p_pair_f32_max, :tg_matmul_mod_p_pair_f32_min),
+    (Float64, :tg_matmul_mod_p_pair_f64_max, :tg_matmul_mod_p_pair_f64_min),
+)
+    for (dir_val, sym) in ((:(Val{:max}), sym_max), (:(Val{:min}), sym_min))
+        @eval function _tg_mod_pair_ccall(::$dir_val, ::Type{$T},
+                                          pair_a, m::Csize_t, k::Csize_t,
+                                          pair_b, n::Csize_t,
+                                          p::Int32,
+                                          out_val::Vector{$T},
+                                          out_cnt::Vector{Int32})
+            ccall(($(QuoteNode(sym)), _libpath()), Cint,
+                  (Ptr{Cvoid}, Csize_t, Csize_t,
+                   Ptr{Cvoid}, Csize_t,
+                   Int32,
+                   Ptr{$T}, Ptr{Int32}),
+                  pair_a, m, k,
+                  pair_b, n,
+                  p,
+                  out_val, out_cnt)
+        end
+    end
+end
+
+# Internal core. Both public entries call this with their CT and dir Val.
+# E is the concrete element type CT{T, P}.
+function _tropical_matmul_core(::Type{E}, dir_val::Val,
+                               A::AbstractMatrix{E},
+                               B::AbstractMatrix{E}
+                              ) where {E}
+    T = fieldtype(E, 1)  # Float32 or Float64
+    P = E.parameters[2]
+    m, k = size(A); k2, n = size(B)
+    k == k2 || throw(DimensionMismatch(
+        "A is $(size(A)) but B is $(size(B)); inner dims must match"))
+    _check_mod_p(P)
+
+    pair_a = _row_major_pair(A)
+    pair_b = _row_major_pair(B)
+    out_val = Vector{T}(undef, m * n)
+    out_cnt = Vector{Int32}(undef, m * n)
+
+    _check_version()
+    code = _tg_mod_pair_ccall(dir_val, T,
+        pair_a, Csize_t(m), Csize_t(k),
+        pair_b, Csize_t(n),
+        Int32(P),
+        out_val, out_cnt)
+    if code != Int32(0)
+        _throw_for(Int32(code))
+    end
+
+    return _zip_to_modct(E, out_val, out_cnt, m, n)
+end
+
+"""
+    tropical_matmul(A, B) -> Matrix{ModCountingTropical{T, P}}
+
+Max-plus counting tropical matrix multiplication on the GPU. `A` and
+`B` must be `AbstractMatrix{ModCountingTropical{T, P}}` for the same
+`T ∈ {Float32, Float64}` and modulus `P` (with `2 <= P < 2^31`).
+Returns a fresh `Matrix{ModCountingTropical{T, P}}` of size
+`(size(A, 1), size(B, 2))`.
+
+Throws `DimensionMismatch` for shape mismatch, `ArgumentError` for
+invalid `P`, and `CountingTropicalGEMMError` for FFI/CUDA failures.
+"""
+tropical_matmul(A::AbstractMatrix{ModCountingTropical{T, P}},
+                B::AbstractMatrix{ModCountingTropical{T, P}}
+               ) where {T <: Union{Float32, Float64}, P} =
+    _tropical_matmul_core(ModCountingTropical{T, P}, Val(:max), A, B)
+
+"""
+    tropical_matmul_min(A, B) -> Matrix{ModCountingTropicalMin{T, P}}
+
+Min-plus counterpart of `tropical_matmul`. Operates on
+`ModCountingTropicalMin{T, P}` matrices.
+"""
+tropical_matmul_min(A::AbstractMatrix{ModCountingTropicalMin{T, P}},
+                    B::AbstractMatrix{ModCountingTropicalMin{T, P}}
+                   ) where {T <: Union{Float32, Float64}, P} =
+    _tropical_matmul_core(ModCountingTropicalMin{T, P}, Val(:min), A, B)
 
 end # module

@@ -1,4 +1,5 @@
 using Test
+using Random
 using CountingTropicalGEMM
 
 # Reference implementation for cross-checking. Tropical max/min-plus matmul
@@ -166,5 +167,60 @@ end
         big2 = ModCountingTropical{Float32, 2_000_000_011}(0.0f0, Int32(2_000_000_000))
         expected = Int32(mod(Int64(2_000_000_000)^2, Int64(2_000_000_011)))
         @test (big1 * big2).c == expected
+    end
+
+    @testset "tropical_matmul (Max f32)" begin
+        P = 7
+        Random.seed!(1)
+        A = [ModCountingTropical{Float32, P}(
+                Float32(rand(0:3)), Int32(rand(0:P-1))) for _ in 1:5, _ in 1:8]
+        B = [ModCountingTropical{Float32, P}(
+                Float32(rand(0:3)), Int32(rand(0:P-1))) for _ in 1:8, _ in 1:6]
+        # Reference: pure Julia max-plus + count multiply mod P.
+        ref = Matrix{ModCountingTropical{Float32, P}}(undef, 5, 6)
+        for i in 1:5, j in 1:6
+            best_n = -Inf32
+            best_c = Int32(0)
+            for kk in 1:8
+                v = A[i, kk].n + B[kk, j].n
+                c = Int32(mod(Int64(A[i, kk].c) * Int64(B[kk, j].c), Int64(P)))
+                if v > best_n
+                    best_n = v; best_c = c
+                elseif v == best_n
+                    best_c = Int32(mod(Int64(best_c) + Int64(c), Int64(P)))
+                end
+            end
+            ref[i, j] = ModCountingTropical{Float32, P}(best_n, best_c)
+        end
+
+        C = tropical_matmul(A, B)
+        @test C == ref
+    end
+
+    @testset "tropical_matmul_min (Min f64)" begin
+        P = 11
+        Random.seed!(2)
+        A = [ModCountingTropicalMin{Float64, P}(
+                Float64(rand(0:4)), Int32(rand(0:P-1))) for _ in 1:6, _ in 1:9]
+        B = [ModCountingTropicalMin{Float64, P}(
+                Float64(rand(0:4)), Int32(rand(0:P-1))) for _ in 1:9, _ in 1:7]
+        ref = Matrix{ModCountingTropicalMin{Float64, P}}(undef, 6, 7)
+        for i in 1:6, j in 1:7
+            best_n = Inf
+            best_c = Int32(0)
+            for kk in 1:9
+                v = A[i, kk].n + B[kk, j].n
+                c = Int32(mod(Int64(A[i, kk].c) * Int64(B[kk, j].c), Int64(P)))
+                if v < best_n
+                    best_n = v; best_c = c
+                elseif v == best_n
+                    best_c = Int32(mod(Int64(best_c) + Int64(c), Int64(P)))
+                end
+            end
+            ref[i, j] = ModCountingTropicalMin{Float64, P}(best_n, best_c)
+        end
+
+        C = tropical_matmul_min(A, B)
+        @test C == ref
     end
 end
