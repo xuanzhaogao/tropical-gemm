@@ -29,6 +29,21 @@ unsafe impl DeviceRepr for DevPtr {
     }
 }
 
+/// Spec N: per-dtype tile dimensions. Block dim = (BN/TN, BM/TM, 1).
+/// Grid dim = (ceil(N/BN), ceil(M/BM), 1).
+pub trait TileDims {
+    const BM: usize;
+    const BN: usize;
+    const TM: usize;
+    const TN: usize;
+}
+impl TileDims for f32 {
+    const BM: usize = 64; const BN: usize = 64; const TM: usize = 4; const TN: usize = 4;
+}
+impl TileDims for f64 {
+    const BM: usize = 32; const BN: usize = 32; const TM: usize = 2; const TN: usize = 4;
+}
+
 /// Spec M: column-major NN/NT/TN/TT counting matmul launch.
 /// Operates on raw device pointers (caller-owned, e.g. CUDA.jl).
 /// `ctx.device().synchronize()` is called before launch to coordinate
@@ -49,6 +64,7 @@ where
     T: tropical_gemm::types::TropicalScalar
         + cudarc::driver::DeviceRepr
         + cudarc::driver::ValidAsZeroBits
+        + TileDims
         + Default + Clone + Copy
         + 'static,
     D: tropical_gemm::types::TropicalDirection,
@@ -73,11 +89,11 @@ where
     let kernel_name: &'static str = Box::leak(kernel_name_owned.into_boxed_str());
     let kernel = ctx.get_kernel(kernel_name)?;
 
-    // Block 16x16, grid covers M, N (column-major: blockIdx.y is row, blockIdx.x is col).
-    let block: (u32, u32, u32) = (16, 16, 1);
+    // Spec N: dtype-specific tile dims. Block = (BN/TN, BM/TM); grid covers M, N.
+    let block: (u32, u32, u32) = ((T::BN / T::TN) as u32, (T::BM / T::TM) as u32, 1);
     let grid: (u32, u32, u32) = (
-        ((n + 15) / 16) as u32,
-        ((m + 15) / 16) as u32,
+        ((n + T::BN - 1) / T::BN) as u32,
+        ((m + T::BM - 1) / T::BM) as u32,
         1,
     );
     let cfg = cudarc::driver::LaunchConfig {

@@ -51,63 +51,176 @@ struct __align__(16) PairF64 { double val; int cnt; int _pad; };
 #define B_OFF_N(k, j, K_, N_) ((k) + (j) * (K_))
 #define B_OFF_T(k, j, K_, N_) ((j) + (k) * (N_))
 
-#define TROPICAL_MATMUL_BODY(T, PAIR, INIT_VAL, BETTER, A_OFF, B_OFF)          \
+// ---- Spec N: tile-size constants and layout-aware loader decompositions ----
+//
+// Tile sizes per dtype:
+//   f32: BM=BN=64, BK=8, TM=TN=4 → block = (BN/TN, BM/TM) = (16, 16) = 256 threads.
+//   f64: BM=BN=32, BK=8, TM=2,  TN=4 → block = (BN/TN, BM/TM) = (8, 16) = 128 threads.
+//
+// LOAD_*_DECOMP_{N,T}: maps a linear loader index `idx` (0..BM*BK or 0..BN*BK)
+// to the (sk, si) or (sk, sj) shared-tile slot, with the contiguous global
+// axis varying fastest across `idx` so consecutive lane indices read
+// consecutive global addresses.
+//
+// 'N' op A: pair_a[i + k*M] is M-contiguous → fastest-axis = si.
+// 'T' op A: pair_a[k + i*K] is K-contiguous → fastest-axis = sk.
+// 'N' op B: pair_b[k + j*K] is K-contiguous → fastest-axis = sk.
+// 'T' op B: pair_b[j + k*N] is N-contiguous → fastest-axis = sj.
+#define LOAD_A_DECOMP_N(idx, BM_, BK_, sk_, si_) \
+    do { (sk_) = (idx) / (BM_); (si_) = (idx) % (BM_); } while (0)
+#define LOAD_A_DECOMP_T(idx, BM_, BK_, sk_, si_) \
+    do { (si_) = (idx) / (BK_); (sk_) = (idx) % (BK_); } while (0)
+#define LOAD_B_DECOMP_N(idx, BN_, BK_, sk_, sj_) \
+    do { (sj_) = (idx) / (BK_); (sk_) = (idx) % (BK_); } while (0)
+#define LOAD_B_DECOMP_T(idx, BN_, BK_, sk_, sj_) \
+    do { (sk_) = (idx) / (BN_); (sj_) = (idx) % (BN_); } while (0)
+
+// Tiled tropical matmul body. Block computes a BM×BN output tile with
+// each thread accumulating a TM×TN sub-tile in registers. Loader walks
+// 256 threads × ceil(BM*BK/256) iterations covering the full A tile,
+// then likewise for B; the LOAD_*_DECOMP macros pick the per-layout
+// fastest-varying axis for warp-coalesced global reads.
+#define TROPICAL_MATMUL_TILED_BODY(T, PAIR, INIT_VAL, BETTER,                  \
+    A_OFF, B_OFF, LOAD_A_DECOMP, LOAD_B_DECOMP,                                \
+    BM_, BN_, BK_, TM_, TN_)                                                   \
 {                                                                              \
-    int i = blockIdx.y * blockDim.y + threadIdx.y;                             \
-    int j = blockIdx.x * blockDim.x + threadIdx.x;                             \
-    if (i >= M || j >= N) return;                                              \
+    __shared__ T   As_v[BK_][BM_ + 1];                                         \
+    __shared__ int As_c[BK_][BM_ + 1];                                         \
+    __shared__ T   Bs_v[BK_][BN_ + 1];                                         \
+    __shared__ int Bs_c[BK_][BN_ + 1];                                         \
                                                                                \
-    T                  acc_val = (INIT_VAL);                                   \
-    unsigned long long acc_cnt = 0;                                            \
+    int tx = threadIdx.x, ty = threadIdx.y;                                    \
+    int tid = ty * blockDim.x + tx;                                            \
+    int threads_per_block = blockDim.x * blockDim.y;                           \
+    int block_i0 = blockIdx.y * (BM_);                                         \
+    int block_j0 = blockIdx.x * (BN_);                                         \
+                                                                               \
+    T                  acc_v[TM_][TN_];                                        \
+    unsigned long long acc_c[TM_][TN_];                                        \
+    _Pragma("unroll")                                                          \
+    for (int ti = 0; ti < (TM_); ++ti)                                         \
+        _Pragma("unroll")                                                      \
+        for (int tj = 0; tj < (TN_); ++tj) {                                   \
+            acc_v[ti][tj] = (INIT_VAL);                                        \
+            acc_c[ti][tj] = 0ULL;                                              \
+        }                                                                      \
+                                                                               \
     const unsigned long long Pull = (unsigned long long)P;                     \
+    const int A_TILE = (BM_) * (BK_);                                          \
+    const int B_TILE = (BN_) * (BK_);                                          \
                                                                                \
-    for (int k = 0; k < K; ++k) {                                              \
-        PAIR a = pair_a[A_OFF(i, k, M, K)];                                    \
-        PAIR b = pair_b[B_OFF(k, j, K, N)];                                    \
-        T            pv = a.val + b.val;                                       \
-        unsigned int ca = (unsigned int)a.cnt;                                 \
-        unsigned int cb = (unsigned int)b.cnt;                                 \
-        unsigned long long prod = (unsigned long long)ca * (unsigned long long)cb; \
-        unsigned long long pc = barrett_mod(prod, Pull, MU);                   \
-        bool win = BETTER(pv, acc_val);                                        \
-        bool tie = (pv == acc_val);                                            \
-        acc_val = win ? pv : acc_val;                                          \
-        acc_cnt = win ? pc : (tie ? (acc_cnt + pc) : acc_cnt);                 \
+    for (int kk = 0; kk < K; kk += (BK_)) {                                    \
+        for (int idx = tid; idx < A_TILE; idx += threads_per_block) {          \
+            int sk_a, si_a;                                                    \
+            LOAD_A_DECOMP(idx, (BM_), (BK_), sk_a, si_a);                      \
+            int gi = block_i0 + si_a;                                          \
+            int gk = kk + sk_a;                                                \
+            if (gi < M && gk < K) {                                            \
+                PAIR a = pair_a[A_OFF(gi, gk, M, K)];                          \
+                As_v[sk_a][si_a] = a.val; As_c[sk_a][si_a] = a.cnt;            \
+            } else {                                                           \
+                As_v[sk_a][si_a] = (INIT_VAL); As_c[sk_a][si_a] = 0;           \
+            }                                                                  \
+        }                                                                      \
+        for (int idx = tid; idx < B_TILE; idx += threads_per_block) {          \
+            int sk_b, sj_b;                                                    \
+            LOAD_B_DECOMP(idx, (BN_), (BK_), sk_b, sj_b);                      \
+            int gk = kk + sk_b;                                                \
+            int gj = block_j0 + sj_b;                                          \
+            if (gj < N && gk < K) {                                            \
+                PAIR b = pair_b[B_OFF(gk, gj, K, N)];                          \
+                Bs_v[sk_b][sj_b] = b.val; Bs_c[sk_b][sj_b] = b.cnt;            \
+            } else {                                                           \
+                Bs_v[sk_b][sj_b] = (INIT_VAL); Bs_c[sk_b][sj_b] = 0;           \
+            }                                                                  \
+        }                                                                      \
+        __syncthreads();                                                       \
+                                                                               \
+        int kk_end = (K - kk < (BK_)) ? (K - kk) : (BK_);                      \
+        for (int kk2 = 0; kk2 < kk_end; ++kk2) {                               \
+            T   av[TM_]; int ac[TM_];                                          \
+            T   bv[TN_]; int bc[TN_];                                          \
+            _Pragma("unroll")                                                  \
+            for (int ti = 0; ti < (TM_); ++ti) {                               \
+                av[ti] = As_v[kk2][ty * (TM_) + ti];                           \
+                ac[ti] = As_c[kk2][ty * (TM_) + ti];                           \
+            }                                                                  \
+            _Pragma("unroll")                                                  \
+            for (int tj = 0; tj < (TN_); ++tj) {                               \
+                bv[tj] = Bs_v[kk2][tx * (TN_) + tj];                           \
+                bc[tj] = Bs_c[kk2][tx * (TN_) + tj];                           \
+            }                                                                  \
+            _Pragma("unroll")                                                  \
+            for (int ti = 0; ti < (TM_); ++ti)                                 \
+                _Pragma("unroll")                                              \
+                for (int tj = 0; tj < (TN_); ++tj) {                           \
+                    T pv = av[ti] + bv[tj];                                    \
+                    unsigned long long prod =                                  \
+                        (unsigned long long)(unsigned)ac[ti] *                 \
+                        (unsigned long long)(unsigned)bc[tj];                  \
+                    unsigned long long pc = barrett_mod(prod, Pull, MU);       \
+                    bool win = BETTER(pv, acc_v[ti][tj]);                      \
+                    bool tie = (pv == acc_v[ti][tj]);                          \
+                    acc_v[ti][tj] = win ? pv : acc_v[ti][tj];                  \
+                    acc_c[ti][tj] = win ? pc :                                 \
+                        (tie ? (acc_c[ti][tj] + pc) : acc_c[ti][tj]);          \
+                }                                                              \
+        }                                                                      \
+        __syncthreads();                                                       \
     }                                                                          \
                                                                                \
-    PAIR out;                                                                  \
-    out.val = acc_val;                                                         \
-    out.cnt = (int)barrett_mod(acc_cnt, Pull, MU);                             \
-    out_c[(i) + (j) * M] = out;                                                \
+    _Pragma("unroll")                                                          \
+    for (int ti = 0; ti < (TM_); ++ti) {                                       \
+        int gi = block_i0 + ty * (TM_) + ti;                                   \
+        if (gi >= M) continue;                                                 \
+        _Pragma("unroll")                                                      \
+        for (int tj = 0; tj < (TN_); ++tj) {                                   \
+            int gj = block_j0 + tx * (TN_) + tj;                               \
+            if (gj >= N) continue;                                             \
+            PAIR out;                                                          \
+            out.val = acc_v[ti][tj];                                           \
+            out.cnt = (int)barrett_mod(acc_c[ti][tj], Pull, MU);               \
+            out_c[gi + gj * M] = out;                                          \
+        }                                                                      \
+    }                                                                          \
 }
 
-#define DEFINE_TROPICAL_MATMUL(NAME, T, PAIR, INIT_VAL, BETTER, A_OFF, B_OFF)  \
+#define DEFINE_TILED_F32(NAME, INIT_VAL, BETTER, A_OFF, B_OFF, LOAD_A, LOAD_B) \
 extern "C" __global__ void NAME(                                               \
-    const PAIR* __restrict__ pair_a,                                           \
-    const PAIR* __restrict__ pair_b,                                           \
-    PAIR* __restrict__ out_c,                                                  \
+    const PairF32* __restrict__ pair_a,                                        \
+    const PairF32* __restrict__ pair_b,                                        \
+    PairF32* __restrict__ out_c,                                               \
     int M, int N, int K, int P, unsigned long long MU                          \
 )                                                                              \
-TROPICAL_MATMUL_BODY(T, PAIR, INIT_VAL, BETTER, A_OFF, B_OFF)
+TROPICAL_MATMUL_TILED_BODY(float, PairF32, INIT_VAL, BETTER, A_OFF, B_OFF,     \
+                           LOAD_A, LOAD_B, 64, 64, 8, 4, 4)
 
-// ----- 16 specializations: (T, dir) × (transA, transB) -----
+#define DEFINE_TILED_F64(NAME, INIT_VAL, BETTER, A_OFF, B_OFF, LOAD_A, LOAD_B) \
+extern "C" __global__ void NAME(                                               \
+    const PairF64* __restrict__ pair_a,                                        \
+    const PairF64* __restrict__ pair_b,                                        \
+    PairF64* __restrict__ out_c,                                               \
+    int M, int N, int K, int P, unsigned long long MU                          \
+)                                                                              \
+TROPICAL_MATMUL_TILED_BODY(double, PairF64, INIT_VAL, BETTER, A_OFF, B_OFF,    \
+                           LOAD_A, LOAD_B, 32, 32, 8, 2, 4)
 
-DEFINE_TROPICAL_MATMUL(tropical_matmul_f32_max_NN, float,  PairF32, NEG_INF_F32, MAX_BETTER, A_OFF_N, B_OFF_N)
-DEFINE_TROPICAL_MATMUL(tropical_matmul_f32_max_NT, float,  PairF32, NEG_INF_F32, MAX_BETTER, A_OFF_N, B_OFF_T)
-DEFINE_TROPICAL_MATMUL(tropical_matmul_f32_max_TN, float,  PairF32, NEG_INF_F32, MAX_BETTER, A_OFF_T, B_OFF_N)
-DEFINE_TROPICAL_MATMUL(tropical_matmul_f32_max_TT, float,  PairF32, NEG_INF_F32, MAX_BETTER, A_OFF_T, B_OFF_T)
+DEFINE_TILED_F32(tropical_matmul_f32_max_NN, NEG_INF_F32, MAX_BETTER, A_OFF_N, B_OFF_N, LOAD_A_DECOMP_N, LOAD_B_DECOMP_N)
+DEFINE_TILED_F32(tropical_matmul_f32_max_NT, NEG_INF_F32, MAX_BETTER, A_OFF_N, B_OFF_T, LOAD_A_DECOMP_N, LOAD_B_DECOMP_T)
+DEFINE_TILED_F32(tropical_matmul_f32_max_TN, NEG_INF_F32, MAX_BETTER, A_OFF_T, B_OFF_N, LOAD_A_DECOMP_T, LOAD_B_DECOMP_N)
+DEFINE_TILED_F32(tropical_matmul_f32_max_TT, NEG_INF_F32, MAX_BETTER, A_OFF_T, B_OFF_T, LOAD_A_DECOMP_T, LOAD_B_DECOMP_T)
 
-DEFINE_TROPICAL_MATMUL(tropical_matmul_f32_min_NN, float,  PairF32, POS_INF_F32, MIN_BETTER, A_OFF_N, B_OFF_N)
-DEFINE_TROPICAL_MATMUL(tropical_matmul_f32_min_NT, float,  PairF32, POS_INF_F32, MIN_BETTER, A_OFF_N, B_OFF_T)
-DEFINE_TROPICAL_MATMUL(tropical_matmul_f32_min_TN, float,  PairF32, POS_INF_F32, MIN_BETTER, A_OFF_T, B_OFF_N)
-DEFINE_TROPICAL_MATMUL(tropical_matmul_f32_min_TT, float,  PairF32, POS_INF_F32, MIN_BETTER, A_OFF_T, B_OFF_T)
+DEFINE_TILED_F32(tropical_matmul_f32_min_NN, POS_INF_F32, MIN_BETTER, A_OFF_N, B_OFF_N, LOAD_A_DECOMP_N, LOAD_B_DECOMP_N)
+DEFINE_TILED_F32(tropical_matmul_f32_min_NT, POS_INF_F32, MIN_BETTER, A_OFF_N, B_OFF_T, LOAD_A_DECOMP_N, LOAD_B_DECOMP_T)
+DEFINE_TILED_F32(tropical_matmul_f32_min_TN, POS_INF_F32, MIN_BETTER, A_OFF_T, B_OFF_N, LOAD_A_DECOMP_T, LOAD_B_DECOMP_N)
+DEFINE_TILED_F32(tropical_matmul_f32_min_TT, POS_INF_F32, MIN_BETTER, A_OFF_T, B_OFF_T, LOAD_A_DECOMP_T, LOAD_B_DECOMP_T)
 
-DEFINE_TROPICAL_MATMUL(tropical_matmul_f64_max_NN, double, PairF64, NEG_INF_F64, MAX_BETTER, A_OFF_N, B_OFF_N)
-DEFINE_TROPICAL_MATMUL(tropical_matmul_f64_max_NT, double, PairF64, NEG_INF_F64, MAX_BETTER, A_OFF_N, B_OFF_T)
-DEFINE_TROPICAL_MATMUL(tropical_matmul_f64_max_TN, double, PairF64, NEG_INF_F64, MAX_BETTER, A_OFF_T, B_OFF_N)
-DEFINE_TROPICAL_MATMUL(tropical_matmul_f64_max_TT, double, PairF64, NEG_INF_F64, MAX_BETTER, A_OFF_T, B_OFF_T)
+DEFINE_TILED_F64(tropical_matmul_f64_max_NN, NEG_INF_F64, MAX_BETTER, A_OFF_N, B_OFF_N, LOAD_A_DECOMP_N, LOAD_B_DECOMP_N)
+DEFINE_TILED_F64(tropical_matmul_f64_max_NT, NEG_INF_F64, MAX_BETTER, A_OFF_N, B_OFF_T, LOAD_A_DECOMP_N, LOAD_B_DECOMP_T)
+DEFINE_TILED_F64(tropical_matmul_f64_max_TN, NEG_INF_F64, MAX_BETTER, A_OFF_T, B_OFF_N, LOAD_A_DECOMP_T, LOAD_B_DECOMP_N)
+DEFINE_TILED_F64(tropical_matmul_f64_max_TT, NEG_INF_F64, MAX_BETTER, A_OFF_T, B_OFF_T, LOAD_A_DECOMP_T, LOAD_B_DECOMP_T)
 
-DEFINE_TROPICAL_MATMUL(tropical_matmul_f64_min_NN, double, PairF64, POS_INF_F64, MIN_BETTER, A_OFF_N, B_OFF_N)
-DEFINE_TROPICAL_MATMUL(tropical_matmul_f64_min_NT, double, PairF64, POS_INF_F64, MIN_BETTER, A_OFF_N, B_OFF_T)
-DEFINE_TROPICAL_MATMUL(tropical_matmul_f64_min_TN, double, PairF64, POS_INF_F64, MIN_BETTER, A_OFF_T, B_OFF_N)
-DEFINE_TROPICAL_MATMUL(tropical_matmul_f64_min_TT, double, PairF64, POS_INF_F64, MIN_BETTER, A_OFF_T, B_OFF_T)
+DEFINE_TILED_F64(tropical_matmul_f64_min_NN, POS_INF_F64, MIN_BETTER, A_OFF_N, B_OFF_N, LOAD_A_DECOMP_N, LOAD_B_DECOMP_N)
+DEFINE_TILED_F64(tropical_matmul_f64_min_NT, POS_INF_F64, MIN_BETTER, A_OFF_N, B_OFF_T, LOAD_A_DECOMP_N, LOAD_B_DECOMP_T)
+DEFINE_TILED_F64(tropical_matmul_f64_min_TN, POS_INF_F64, MIN_BETTER, A_OFF_T, B_OFF_N, LOAD_A_DECOMP_T, LOAD_B_DECOMP_N)
+DEFINE_TILED_F64(tropical_matmul_f64_min_TT, POS_INF_F64, MIN_BETTER, A_OFF_T, B_OFF_T, LOAD_A_DECOMP_T, LOAD_B_DECOMP_T)

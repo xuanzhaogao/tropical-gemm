@@ -35,6 +35,7 @@ where
     T: tropical_gemm::types::TropicalScalar
         + DeviceRepr
         + ValidAsZeroBits
+        + crate::counting_kernel::TileDims
         + Default + Clone + Copy
         + 'static,
     D: TropicalDirection,

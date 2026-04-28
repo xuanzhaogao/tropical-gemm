@@ -84,6 +84,7 @@ where
     T: tropical_gemm::types::TropicalScalar
         + cudarc::driver::DeviceRepr
         + cudarc::driver::ValidAsZeroBits
+        + crate::counting_kernel::TileDims
         + Default + Clone + Copy
         + 'static,
     D: tropical_gemm::types::TropicalDirection,
