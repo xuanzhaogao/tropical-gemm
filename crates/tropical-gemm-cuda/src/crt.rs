@@ -14,7 +14,7 @@ use tropical_gemm::types::TropicalDirection;
 use tropical_gemm::CountedMat;
 
 use crate::context::CudaContext;
-use crate::counting_kernel::{launch_counting_gemm, CountingCudaKernel};
+use crate::counting_kernel::{launch_counting_gemm_ones, CountingCudaKernel};
 use crate::error::{CudaError, Result};
 use crate::memory::GpuMatrix;
 use crate::pair::PackPair;
@@ -45,16 +45,12 @@ where
     assert_eq!(a_values.len(), m * k);
     assert_eq!(b_values.len(), k * n);
 
-    // Pack (value, count=1) into AoS once. Counts are all-ones at the entry
-    // point; per-prime kernels then read 8 B (f32) or 16 B (f64) per element
-    // in a single LDG instead of two separate LDG.E.32. Pack runs once,
-    // amortized across the prime loop.
-    let pair_a_host = <T as PackPair>::pack_ones(a_values);
-    let pair_b_host = <T as PackPair>::pack_ones(b_values);
-    let pair_a = GpuMatrix::<<T as PackPair>::Pair>::from_host(ctx, &pair_a_host, m, k)?;
-    let pair_b = GpuMatrix::<<T as PackPair>::Pair>::from_host(ctx, &pair_b_host, k, n)?;
-    drop(pair_a_host);
-    drop(pair_b_host);
+    // Counts at the entry point are uniformly 1. Use the ones-specialized
+    // kernel: value-only inputs uploaded verbatim (no AoS pack), count
+    // multiply and per-step Barrett dropped (~1.5-2x speedup over the AoS
+    // general kernel; see Spec G).
+    let value_a_dev = GpuMatrix::<T>::from_host(ctx, a_values, m, k)?;
+    let value_b_dev = GpuMatrix::<T>::from_host(ctx, b_values, k, n)?;
 
     // Output buffers reused across primes. GPU-side zero-init (no host→device
     // upload of zero buffers).
@@ -73,10 +69,10 @@ where
     for (i, &prime_idx) in prime_indices.iter().enumerate() {
         let p = CRT_PRIMES[prime_idx];
 
-        launch_counting_gemm::<T, D>(
+        launch_counting_gemm_ones::<T, D>(
             ctx,
-            &pair_a,
-            &pair_b,
+            &value_a_dev,
+            &value_b_dev,
             &mut value_c,
             &mut count_c,
             p,

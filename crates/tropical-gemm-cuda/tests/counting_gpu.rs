@@ -241,3 +241,64 @@ fn warpk_min_direction_f64() {
     assert_eq!(gpu.values, cpu.values);
     assert_eq!(gpu.counts, cpu.counts);
 }
+
+// ------------------------------------------------------------------
+// Spec G — ones-specialized kernel correctness (production path).
+//
+// `count_ground_states_gpu` now routes through the ones kernels. The
+// pre-existing tests above already cover the all-ones case via the driver,
+// so these focus on regimes the warpk tests already exercise — naive↔warpk
+// boundary, non-aligned dims, and tie-heavy reductions — but specifically
+// to catch regressions in the ones path's u32 accumulator and simpler
+// shuffle reduction (single shuffle per acc_cnt instead of hi/lo split).
+// ------------------------------------------------------------------
+
+#[test]
+fn ones_k_threshold_boundary() {
+    let ctx = CudaContext::new().unwrap();
+    for &k in &[32usize, 63, 64, 65, 95, 128] {
+        let (m, n) = (8, 8);
+        let a = random_ish_matrix(m, k, 0xa1a1 ^ (k as u64));
+        let b = random_ish_matrix(k, n, 0xb2b2 ^ (k as u64));
+        let bound = bound_for_single_matmul(k);
+        let cpu = count_ground_states::<f32, Max>(&a, m, k, &b, n, &bound);
+        let gpu = count_ground_states_gpu::<f32, Max>(&ctx, &a, m, k, &b, n, &bound).unwrap();
+        assert_eq!(gpu.values, cpu.values, "values mismatch at K={}", k);
+        assert_eq!(gpu.counts, cpu.counts, "counts mismatch at K={}", k);
+    }
+}
+
+#[test]
+fn ones_non_aligned_dims_f64() {
+    // f64 + tail-row predication + non-multiple-of-32 K.
+    let ctx = CudaContext::new().unwrap();
+    let (m, k, n) = (37, 131, 29);
+    let mut state: u64 = 0xfacefeed;
+    let mut gen = || {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((state >> 33) as u32 % 5) as f64
+    };
+    let a: Vec<f64> = (0..m * k).map(|_| gen()).collect();
+    let b: Vec<f64> = (0..k * n).map(|_| gen()).collect();
+    let bound = bound_for_single_matmul(k);
+    let cpu = count_ground_states::<f64, Max>(&a, m, k, &b, n, &bound);
+    let gpu = count_ground_states_gpu::<f64, Max>(&ctx, &a, m, k, &b, n, &bound).unwrap();
+    assert_eq!(gpu.values, cpu.values);
+    assert_eq!(gpu.counts, cpu.counts);
+}
+
+#[test]
+fn ones_all_ties_large_k_warpk() {
+    // K=200 forces warpk path. All inputs equal -> every k contributes the
+    // same partial. Output count should be K mod P = 200 (well below P).
+    // Exercises u32 acc_cnt addition under warp shuffle reduction in the
+    // ones-specialized kernel.
+    let ctx = CudaContext::new().unwrap();
+    let (m, k, n) = (5, 200, 7);
+    let a = vec![0.0_f32; m * k];
+    let b = vec![0.0_f32; k * n];
+    let bound = bound_for_single_matmul(k);
+    let gpu = count_ground_states_gpu::<f32, Max>(&ctx, &a, m, k, &b, n, &bound).unwrap();
+    assert_eq!(gpu.values, vec![0.0; m * n]);
+    assert_eq!(gpu.counts, vec![BigInt::from(k); m * n]);
+}

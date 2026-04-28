@@ -64,10 +64,16 @@ const KERNEL_NAMES: &[&str] = &[
     "tropical_maxmul_f32_nn_batched_with_argmax",
 ];
 
-/// Counting GEMM kernel function names. AoS (value, count) element layout
-/// throughout — naive (one thread per output cell) and warpk (32 threads
-/// cooperate per cell) variants.
+/// Counting GEMM kernel function names. Two layouts:
+///   - AoS general: packed (value, count) inputs. Used for non-trivial input
+///     counts (future callers; currently no production caller).
+///   - ones-specialized: value-only inputs, hard-coded count=1. Used by the
+///     `count_ground_states_gpu` driver. Drops count loads, count multiply,
+///     and per-step Barrett. ~1.5-2x faster than AoS general.
+/// Each layout has naive (one thread per cell) and warpk (32 threads/cell)
+/// variants.
 const COUNTING_KERNEL_NAMES: &[&str] = &[
+    // AoS general.
     "counting_gemm_f32_max",
     "counting_gemm_f32_min",
     "counting_gemm_f64_max",
@@ -76,6 +82,15 @@ const COUNTING_KERNEL_NAMES: &[&str] = &[
     "counting_gemm_f32_min_warpk",
     "counting_gemm_f64_max_warpk",
     "counting_gemm_f64_min_warpk",
+    // ones-specialized.
+    "counting_gemm_f32_max_ones",
+    "counting_gemm_f32_min_ones",
+    "counting_gemm_f64_max_ones",
+    "counting_gemm_f64_min_ones",
+    "counting_gemm_f32_max_warpk_ones",
+    "counting_gemm_f32_min_warpk_ones",
+    "counting_gemm_f64_max_warpk_ones",
+    "counting_gemm_f64_min_warpk_ones",
 ];
 
 /// Dispatch knob #1: minimum K to consider warpk. Below this, the warp-stride

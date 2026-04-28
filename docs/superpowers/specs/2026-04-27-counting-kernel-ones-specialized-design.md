@@ -161,3 +161,33 @@ If wins are at-or-above expectations, no further action. If wins are below 1.3×
 - **Future non-ones callers.** Mitigated: AoS general kernels stay; routing is a one-line switch in the driver.
 - **Cache-pressure equivalence with AoS.** Inner loop now does 2× fp32 loads instead of 2× pair loads. Both same total bytes (8 B/k for f32). The win is in instruction count and the disappeared int multiply / Barrett, not memory traffic. Don't expect this to magically fix bandwidth-bound regimes.
 - **Tie correctness under warp reduce.** The `acc_cnt + oc` is a plain u32 add, no Barrett. Tested by `ones_all_ties_large_k`.
+
+## Outcome (measured 2026-04-27 on A100-SXM4-80GB)
+
+**Massively above expectations.** Spec predicted 1.6–2.1× kernel speedup; measured 2.9–3.2× on the dominant naive path. The estimate underweighted how expensive the count multiply + Barrett were relative to fp work.
+
+**Naive path (square shapes, f32 Max, 1 prime, kernel-only):**
+
+| Size | AoS general G/s | ones G/s | speedup |
+|---|---|---|---|
+| 128² | 163 | 348 | 2.13× |
+| 256² | 409 | 1203 | 2.94× |
+| 512² | 570 | 1729 | 3.03× |
+| 1024² | 625 | 1944 | 3.11× |
+| **2048²** | 665 | **2136** | **3.21×** |
+| **4096²** | 665 | **1946** | **2.93×** |
+
+The ones kernel **exceeds the prior MaxPlus reference (~1500 G/s, no counting)** at all sizes ≥ 512². Likely explanation: removing both the count loads (halving bandwidth) and the count arithmetic frees up enough cycles that the kernel becomes compute-bound on a streamlined critical path, beating older MaxPlus implementations.
+
+**Warpk path:** modest 1.0–1.2× — that regime is bottlenecked by strided-B reads, so dropping count machinery doesn't help as much.
+
+**Tests:** 16/16 green (3 new ones-path tests + 13 prior). Existing integration tests now route through the ones path via `count_ground_states_gpu`, so coverage of the production path is identical to before.
+
+**Files:**
+- `kernels/counting_gemm.cu`: 8 new kernels (4 naive ones + 4 warpk ones).
+- `src/context.rs`, `src/counting_kernel.rs`: kernel name registry, trait consts, `launch_counting_gemm_ones` method + free fn.
+- `src/crt.rs`: driver routes through ones path; AoS pack code removed.
+- `tests/counting_gpu.rs`: 3 ones-path correctness tests.
+- `examples/bench_kernel_only.rs`: AoS-vs-ones head-to-head bench.
+
+**AoS general kernels remain in tree** for future callers passing non-trivial input counts (chained matmul, etc.). They are now orphaned in production but are reachable via `launch_counting_gemm` for benchmarks and future work.

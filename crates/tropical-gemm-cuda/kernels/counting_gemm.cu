@@ -155,3 +155,96 @@ COUNTING_GEMM_WARPK(counting_gemm_f32_max_warpk, float,  PairF32, NEG_INF_F32, M
 COUNTING_GEMM_WARPK(counting_gemm_f32_min_warpk, float,  PairF32, POS_INF_F32, MIN_BETTER)
 COUNTING_GEMM_WARPK(counting_gemm_f64_max_warpk, double, PairF64, NEG_INF_F64, MAX_BETTER)
 COUNTING_GEMM_WARPK(counting_gemm_f64_min_warpk, double, PairF64, POS_INF_F64, MIN_BETTER)
+
+// ============================================================================
+// Spec G — ones-specialized variants.
+//
+// All input counts are 1 (the entry-point case for count_ground_states_gpu).
+// Drops the count buffers, count multiply, and per-step Barrett. The output
+// count at cell (i, j) is the number of k positions tied at the optimum,
+// bounded by K — fits in u32 for any K <= 2^32. Single Barrett at the end.
+//
+// Inner loop work: 2 fp loads + 1 fp add + 1 compare + 1 conditional set/inc.
+// That's the irreducible work for tropical-add-with-counting on ones inputs.
+// ============================================================================
+
+#define COUNTING_GEMM_ONES(NAME, T, INIT_VAL, BETTER)                          \
+extern "C" __global__ void NAME(                                               \
+    const T* __restrict__ value_a,                                             \
+    const T* __restrict__ value_b,                                             \
+    T*       __restrict__ value_c, int* __restrict__ count_c,                  \
+    int M, int N, int K, int P, unsigned long long MU                          \
+) {                                                                            \
+    int i = blockIdx.y * blockDim.y + threadIdx.y;                             \
+    int j = blockIdx.x * blockDim.x + threadIdx.x;                             \
+    if (i >= M || j >= N) return;                                              \
+                                                                               \
+    T            acc_val = (INIT_VAL);                                         \
+    unsigned int acc_cnt = 0;                                                  \
+                                                                               \
+    for (int k = 0; k < K; ++k) {                                              \
+        T va = value_a[OFFSET_ROW(i, k, K)];                                   \
+        T vb = value_b[OFFSET_ROW(k, j, N)];                                   \
+        T pv = va + vb;                                                        \
+        bool win = BETTER(pv, acc_val);                                        \
+        bool tie = (pv == acc_val);                                            \
+        acc_val  = win ? pv : acc_val;                                         \
+        acc_cnt  = win ? 1u : (tie ? (acc_cnt + 1u) : acc_cnt);                \
+    }                                                                          \
+    value_c[OFFSET_ROW(i, j, N)] = acc_val;                                    \
+    count_c[OFFSET_ROW(i, j, N)] = (int)barrett_mod(                           \
+        (unsigned long long)acc_cnt, (unsigned long long)P, MU);               \
+}
+
+COUNTING_GEMM_ONES(counting_gemm_f32_max_ones, float,  NEG_INF_F32, MAX_BETTER)
+COUNTING_GEMM_ONES(counting_gemm_f32_min_ones, float,  POS_INF_F32, MIN_BETTER)
+COUNTING_GEMM_ONES(counting_gemm_f64_max_ones, double, NEG_INF_F64, MAX_BETTER)
+COUNTING_GEMM_ONES(counting_gemm_f64_min_ones, double, POS_INF_F64, MIN_BETTER)
+
+#define COUNTING_GEMM_WARPK_ONES(NAME, T, INIT_VAL, BETTER)                    \
+extern "C" __global__ void NAME(                                               \
+    const T* __restrict__ value_a,                                             \
+    const T* __restrict__ value_b,                                             \
+    T*       __restrict__ value_c, int* __restrict__ count_c,                  \
+    int M, int N, int K, int P, unsigned long long MU                          \
+) {                                                                            \
+    int lane = threadIdx.x;                                                    \
+    int i    = blockIdx.y * blockDim.y + threadIdx.y;                          \
+    int j    = blockIdx.x;                                                     \
+    if (i >= M) return;                                                        \
+                                                                               \
+    T            acc_val = (INIT_VAL);                                         \
+    unsigned int acc_cnt = 0;                                                  \
+                                                                               \
+    for (int k = lane; k < K; k += 32) {                                       \
+        T va = value_a[OFFSET_ROW(i, k, K)];                                   \
+        T vb = value_b[OFFSET_ROW(k, j, N)];                                   \
+        T pv = va + vb;                                                        \
+        bool win = BETTER(pv, acc_val);                                        \
+        bool tie = (pv == acc_val);                                            \
+        acc_val  = win ? pv : acc_val;                                         \
+        acc_cnt  = win ? 1u : (tie ? (acc_cnt + 1u) : acc_cnt);                \
+    }                                                                          \
+                                                                               \
+    /* 5-step warp shuffle tree reduction. acc_cnt is u32 -> single shuffle */ \
+    /* per step (no hi/lo split needed). */                                    \
+    for (int off = 16; off > 0; off >>= 1) {                                   \
+        T            ov = __shfl_xor_sync(0xffffffff, acc_val, off);           \
+        unsigned int oc = __shfl_xor_sync(0xffffffff, acc_cnt, off);           \
+        bool win = BETTER(ov, acc_val);                                        \
+        bool tie = (ov == acc_val);                                            \
+        acc_val = win ? ov : acc_val;                                          \
+        acc_cnt = win ? oc : (tie ? (acc_cnt + oc) : acc_cnt);                 \
+    }                                                                          \
+                                                                               \
+    if (lane == 0) {                                                           \
+        value_c[OFFSET_ROW(i, j, N)] = acc_val;                                \
+        count_c[OFFSET_ROW(i, j, N)] = (int)barrett_mod(                       \
+            (unsigned long long)acc_cnt, (unsigned long long)P, MU);           \
+    }                                                                          \
+}
+
+COUNTING_GEMM_WARPK_ONES(counting_gemm_f32_max_warpk_ones, float,  NEG_INF_F32, MAX_BETTER)
+COUNTING_GEMM_WARPK_ONES(counting_gemm_f32_min_warpk_ones, float,  POS_INF_F32, MIN_BETTER)
+COUNTING_GEMM_WARPK_ONES(counting_gemm_f64_max_warpk_ones, double, NEG_INF_F64, MAX_BETTER)
+COUNTING_GEMM_WARPK_ONES(counting_gemm_f64_min_warpk_ones, double, POS_INF_F64, MIN_BETTER)
