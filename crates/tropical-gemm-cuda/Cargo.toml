@@ -10,6 +10,9 @@ keywords = ["tropical", "cuda", "gpu", "matrix", "gemm"]
 categories = ["algorithms", "mathematics", "science"]
 readme = "../../README.md"
 
+[lib]
+crate-type = ["rlib", "cdylib"]
+
 [dependencies]
 tropical-gemm = { workspace = true }
 cudarc = { workspace = true }

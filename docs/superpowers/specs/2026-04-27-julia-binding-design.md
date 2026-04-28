@@ -125,3 +125,23 @@ No Julia↔Rust cross-check inside the package — the Rust side has 21/21 integ
 4. Commit.
 
 If anything in the above shape regresses the Rust crate's existing tests, stop and investigate before adding more.
+
+## Outcome (measured 2026-04-27 on A100-SXM4-80GB)
+
+Landed cleanly. `cargo build --release -p tropical-gemm-cuda` produces both `libtropical_gemm_cuda.rlib` (used by Python crate) and `libtropical_gemm_cuda.so`. All 6 expected symbols exported (`tg_api_version`, `tg_last_error_message`, four `tg_count_ground_states_gpu_u64_*`).
+
+Julia package tests (8/8 green) on A100:
+1. `f32 Max small` — hand-verifiable 2×2 case.
+2. `f64 Min vs reference` — randomized 12×17 × 17×11 against pure-Julia loop.
+3. `all-ties large K` — M=5, K=200, N=7, asserts counts == K.
+4. `BoundTooLargeError` — bound = 2^62, asserts typed exception.
+5. `DimensionMismatch` — asserts native Julia `DimensionMismatch` thrown.
+
+**Files:**
+- `crates/tropical-gemm-cuda/Cargo.toml` — added `crate-type = ["rlib", "cdylib"]`.
+- `crates/tropical-gemm-cuda/src/c_api.rs` — 4 entry points + last-error TLS + version + panic-catch wrappers.
+- `crates/tropical-gemm-cuda/src/lib.rs` — `pub mod c_api;`.
+- `CountingTropicalGEMM.jl/Project.toml` — package metadata.
+- `CountingTropicalGEMM.jl/src/CountingTropicalGEMM.jl` — main module (~150 LOC).
+- `CountingTropicalGEMM.jl/test/runtests.jl` — 5 testsets.
+- `CountingTropicalGEMM.jl/README.md` — usage + library resolution docs.

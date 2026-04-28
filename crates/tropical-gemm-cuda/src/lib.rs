@@ -42,6 +42,7 @@
 //! global context that persists across calls. This avoids the ~7 second NVRTC
 //! compilation overhead on each call.
 
+pub mod c_api;
 mod context;
 pub(crate) mod counting_kernel;
 pub mod crt;
