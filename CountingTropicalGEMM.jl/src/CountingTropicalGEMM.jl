@@ -440,13 +440,26 @@ end
 Base.:(==)(a::ModCountingTropicalMin, b::ModCountingTropicalMin) =
     a.n == b.n && a.c == b.c
 
+# Extract the modulus P from a ModCountingTropical[Min] element type.
+# Used by the matmul core to thread P into _check_mod_p without an
+# untyped E.parameters[2] lookup.
+@inline _modulus(::Type{ModCountingTropical{T, P}}) where {T, P} = P
+@inline _modulus(::Type{ModCountingTropicalMin{T, P}}) where {T, P} = P
+
 # ---------------------------------------------------------------------------
 # Spec K Task 7: tropical_matmul / tropical_matmul_min on ModCountingTropical*.
-# Uses the fast-path C ABI: input matrices are reinterpreted as Matrix{PairT}
-# (zero per-element copy — the byte layout already matches), then transposed
-# into a row-major Vector{PairT} buffer and shipped to the GPU. Output is SoA
-# (Vector{T}, Vector{Int32}); we zip back into a column-major matrix of the
-# input type.
+# Pack the column-major input into a row-major Vector{PairT} buffer in a
+# single host pass (the unavoidable column→row transpose dictated by the
+# row-major kernel ABI), then ship via the fast-path C ABI
+# tg_matmul_mod_p_pair_<T>_<dir>. Output is SoA (Vector{T}, Vector{Int32});
+# we zip back into a column-major Matrix of the input type.
+#
+# Note: a true zero-copy reinterpret would only work for Float32 (PairF32 has
+# no explicit pad); Julia 1.11 rejects reinterpreting a
+# ModCountingTropical{Float64, P} as PairF64 because the latter has an
+# explicit _pad::Int32 field. Even on Float32, the row-major buffer must be
+# materialized via collect, so the per-element pack costs the same as the
+# transpose itself.
 # ---------------------------------------------------------------------------
 
 # Validate P is in the i32 positive range required by the kernel.
@@ -534,7 +547,7 @@ function _tropical_matmul_core(::Type{E}, dir_val::Val,
                                B::AbstractMatrix{E}
                               ) where {E}
     T = fieldtype(E, 1)  # Float32 or Float64
-    P = E.parameters[2]
+    P = _modulus(E)
     m, k = size(A); k2, n = size(B)
     k == k2 || throw(DimensionMismatch(
         "A is $(size(A)) but B is $(size(B)); inner dims must match"))
