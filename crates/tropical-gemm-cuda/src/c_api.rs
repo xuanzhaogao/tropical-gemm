@@ -43,7 +43,7 @@ use crate::error::CudaError;
 use crate::get_global_context;
 use crate::memory::GpuMatrix;
 use crate::pair::PackPair;
-use crate::matmul_mod::matmul_mod_p;
+use crate::matmul_mod::{matmul_mod_p, matmul_mod_p_pair};
 
 /// Bumped on any source-incompatible C ABI change. The Julia binding (or
 /// any other ABI consumer) is expected to assert this at load time.
@@ -291,6 +291,105 @@ cabi_matmul_mod_p!(tg_matmul_mod_p_f64_max, f64, Max);
 cabi_matmul_mod_p!(tg_matmul_mod_p_f64_min, f64, Min);
 
 // ---------------------------------------------------------------------------
+// Spec K: single-prime mod-P matmul. Fast-path C ABI (pre-packed Pair input).
+// Caller has already packed (val, cnt) into the device-compatible PairT layout.
+// Input pointers are opaque c_void to sidestep slice-alignment UB; the Rust
+// side reinterprets them as `&[<T as PackPair>::Pair]` after asserting the
+// caller's responsibility (see safety comment below).
+// ---------------------------------------------------------------------------
+
+fn run_matmul_mod_p_pair<T, D>(
+    pair_a: *const std::ffi::c_void,
+    m: usize, k: usize,
+    pair_b: *const std::ffi::c_void,
+    n: usize,
+    p: i32,
+    out_val: *mut T, out_cnt: *mut i32,
+) -> i32
+where
+    T: tropical_gemm::types::TropicalScalar
+        + cudarc::driver::DeviceRepr
+        + cudarc::driver::ValidAsZeroBits
+        + Default + Clone + Copy
+        + crate::pair::PackPair
+        + 'static,
+    D: tropical_gemm::types::TropicalDirection,
+    (T, D): crate::counting_kernel::CountingCudaKernel<T, D>,
+{
+    if pair_a.is_null() || pair_b.is_null()
+        || out_val.is_null() || out_cnt.is_null()
+    {
+        store_error("null pointer");
+        return ERR_INVALID_INPUT;
+    }
+    if m == 0 || k == 0 || n == 0 {
+        store_error("dimensions must be non-zero");
+        return ERR_INVALID_INPUT;
+    }
+    if p < 2 {
+        store_error(format!("modulus must be >= 2, got {}", p));
+        return ERR_INVALID_INPUT;
+    }
+
+    // SAFETY: caller asserts the pointers reference valid Pair-typed buffers
+    // of length m*k and k*n respectively, with alignment matching `PairT`
+    // (8 B for PairF32, 16 B for PairF64). Julia's heap allocator returns
+    // >= 16 B-aligned arrays, and the Pair stride matches the element size,
+    // so this is satisfied for `Matrix{CountingTropical{T, Mod{P, Int32}}}`.
+    let pair_a_typed = pair_a as *const <T as crate::pair::PackPair>::Pair;
+    let pair_b_typed = pair_b as *const <T as crate::pair::PackPair>::Pair;
+    let pair_a_s = unsafe { std::slice::from_raw_parts(pair_a_typed, m * k) };
+    let pair_b_s = unsafe { std::slice::from_raw_parts(pair_b_typed, k * n) };
+    let out_val_s = unsafe { std::slice::from_raw_parts_mut(out_val, m * n) };
+    let out_cnt_s = unsafe { std::slice::from_raw_parts_mut(out_cnt, m * n) };
+
+    let ctx = match get_global_context() {
+        Ok(c) => c,
+        Err(e) => {
+            store_error(format!("CUDA context init failed: {}", e));
+            return ERR_CUDA;
+        }
+    };
+
+    match matmul_mod_p_pair::<T, D>(
+        ctx, pair_a_s, m, k, pair_b_s, n, p,
+        out_val_s, out_cnt_s,
+    ) {
+        Ok(()) => OK,
+        Err(e) => { store_error(format!("{}", e)); ERR_CUDA }
+    }
+}
+
+macro_rules! cabi_matmul_mod_p_pair {
+    ($name:ident, $T:ty, $D:ty) => {
+        #[no_mangle]
+        pub extern "C" fn $name(
+            pair_a: *const std::ffi::c_void,
+            m: usize, k: usize,
+            pair_b: *const std::ffi::c_void,
+            n: usize,
+            p: i32,
+            out_val: *mut $T, out_cnt: *mut i32,
+        ) -> c_int {
+            let res = catch_unwind(AssertUnwindSafe(|| {
+                run_matmul_mod_p_pair::<$T, $D>(
+                    pair_a, m, k, pair_b, n, p, out_val, out_cnt,
+                )
+            }));
+            match res {
+                Ok(code) => code,
+                Err(_) => { store_error("Rust panic across FFI boundary"); ERR_INTERNAL }
+            }
+        }
+    };
+}
+
+cabi_matmul_mod_p_pair!(tg_matmul_mod_p_pair_f32_max, f32, Max);
+cabi_matmul_mod_p_pair!(tg_matmul_mod_p_pair_f32_min, f32, Min);
+cabi_matmul_mod_p_pair!(tg_matmul_mod_p_pair_f64_max, f64, Max);
+cabi_matmul_mod_p_pair!(tg_matmul_mod_p_pair_f64_min, f64, Min);
+
+// ---------------------------------------------------------------------------
 // Kernel-only timing: upload data once, run the kernel `iters` times, and
 // return the average per-launch wall time in milliseconds. Bypasses CRT
 // combine and BigInt/u64 reconstruction entirely. For perf measurement
@@ -500,6 +599,31 @@ mod tests {
         let code = tg_matmul_mod_p_f32_max(
             a_val.as_ptr(), a_cnt.as_ptr(), 2, 2,
             b_val.as_ptr(), b_cnt.as_ptr(), 2,
+            7,
+            out_val.as_mut_ptr(), out_cnt.as_mut_ptr(),
+        );
+        assert_eq!(code, OK);
+        assert_eq!(out_val, vec![9.0_f32, 10.0, 11.0, 12.0]);
+        assert_eq!(out_cnt, vec![1_i32, 1, 1, 1]);
+    }
+
+    #[test]
+    fn matmul_mod_p_pair_f32_max_smoke() {
+        use crate::pair::PairF32;
+        let pair_a = vec![
+            PairF32::new(1.0, 1), PairF32::new(2.0, 1),
+            PairF32::new(3.0, 1), PairF32::new(4.0, 1),
+        ];
+        let pair_b = vec![
+            PairF32::new(5.0, 1), PairF32::new(6.0, 1),
+            PairF32::new(7.0, 1), PairF32::new(8.0, 1),
+        ];
+        let mut out_val = vec![0.0_f32; 4];
+        let mut out_cnt = vec![0_i32; 4];
+
+        let code = tg_matmul_mod_p_pair_f32_max(
+            pair_a.as_ptr() as *const std::ffi::c_void, 2, 2,
+            pair_b.as_ptr() as *const std::ffi::c_void, 2,
             7,
             out_val.as_mut_ptr(), out_cnt.as_mut_ptr(),
         );
