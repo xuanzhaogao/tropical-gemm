@@ -19,6 +19,51 @@ use crate::pair::PackPair;
 /// (degenerate); `p == 0` is invalid.
 const P_MIN: i32 = 2;
 
+/// Shared device-side core of `matmul_mod_p` and `matmul_mod_p_pair`.
+/// Caller has already validated shapes and produced row-major
+/// `pair_a` (M × K) and `pair_b` (K × N). Uploads, launches the kernel,
+/// and copies SoA outputs back into the caller-provided slices.
+fn run_packed<T, D>(
+    ctx: &CudaContext,
+    pair_a: &[<T as PackPair>::Pair],
+    m: usize,
+    k: usize,
+    pair_b: &[<T as PackPair>::Pair],
+    n: usize,
+    p: i32,
+    out_val: &mut [T],
+    out_cnt: &mut [i32],
+) -> Result<()>
+where
+    T: tropical_gemm::types::TropicalScalar
+        + DeviceRepr
+        + ValidAsZeroBits
+        + Default
+        + Clone
+        + Copy
+        + PackPair
+        + 'static,
+    D: TropicalDirection,
+    (T, D): CountingCudaKernel<T, D>,
+{
+    let pair_a_dev = GpuMatrix::<<T as PackPair>::Pair>::from_host(ctx, pair_a, m, k)?;
+    let pair_b_dev = GpuMatrix::<<T as PackPair>::Pair>::from_host(ctx, pair_b, k, n)?;
+
+    let mut value_c = GpuMatrix::<T>::alloc(ctx, m, n)?;
+    let mut count_c = GpuMatrix::<i32>::alloc(ctx, m, n)?;
+
+    launch_counting_gemm::<T, D>(
+        ctx, &pair_a_dev, &pair_b_dev,
+        &mut value_c, &mut count_c, p,
+    )?;
+
+    let host_val = value_c.to_host(ctx)?;
+    let host_cnt = count_c.to_host(ctx)?;
+    out_val.copy_from_slice(&host_val);
+    out_cnt.copy_from_slice(&host_cnt);
+    Ok(())
+}
+
 /// Slow path: caller provides separate value and count arrays. Pack happens
 /// host-side before upload. Used when the caller's count storage is not
 /// `i32` (e.g. Julia's `Mod{P, Int}` defaults to Int64 on 64-bit hosts).
@@ -81,30 +126,7 @@ where
     let pair_a_host: Vec<<T as PackPair>::Pair> = T::pack_pair(a_val, a_cnt);
     let pair_b_host: Vec<<T as PackPair>::Pair> = T::pack_pair(b_val, b_cnt);
 
-    // Upload.
-    let pair_a_dev = GpuMatrix::<<T as PackPair>::Pair>::from_host(ctx, &pair_a_host, m, k)?;
-    let pair_b_dev = GpuMatrix::<<T as PackPair>::Pair>::from_host(ctx, &pair_b_host, k, n)?;
-
-    let mut value_c = GpuMatrix::<T>::alloc(ctx, m, n)?;
-    let mut count_c = GpuMatrix::<i32>::alloc(ctx, m, n)?;
-
-    // Launch general AoS kernel with the user's prime as modulus.
-    launch_counting_gemm::<T, D>(
-        ctx,
-        &pair_a_dev,
-        &pair_b_dev,
-        &mut value_c,
-        &mut count_c,
-        p,
-    )?;
-
-    // Download.
-    let host_val = value_c.to_host(ctx)?;
-    let host_cnt = count_c.to_host(ctx)?;
-    out_val.copy_from_slice(&host_val);
-    out_cnt.copy_from_slice(&host_cnt);
-
-    Ok(())
+    run_packed::<T, D>(ctx, &pair_a_host, m, k, &pair_b_host, n, p, out_val, out_cnt)
 }
 
 /// Fast path: caller has already packed into the device-compatible
@@ -160,28 +182,7 @@ where
         ));
     }
 
-    // Upload directly — no host-side pack.
-    let pair_a_dev = GpuMatrix::<<T as PackPair>::Pair>::from_host(ctx, pair_a, m, k)?;
-    let pair_b_dev = GpuMatrix::<<T as PackPair>::Pair>::from_host(ctx, pair_b, k, n)?;
-
-    let mut value_c = GpuMatrix::<T>::alloc(ctx, m, n)?;
-    let mut count_c = GpuMatrix::<i32>::alloc(ctx, m, n)?;
-
-    launch_counting_gemm::<T, D>(
-        ctx,
-        &pair_a_dev,
-        &pair_b_dev,
-        &mut value_c,
-        &mut count_c,
-        p,
-    )?;
-
-    let host_val = value_c.to_host(ctx)?;
-    let host_cnt = count_c.to_host(ctx)?;
-    out_val.copy_from_slice(&host_val);
-    out_cnt.copy_from_slice(&host_cnt);
-
-    Ok(())
+    run_packed::<T, D>(ctx, pair_a, m, k, pair_b, n, p, out_val, out_cnt)
 }
 
 #[cfg(test)]
@@ -303,6 +304,52 @@ mod tests {
         ).expect("driver ok");
 
         // Reference.
+        for i in 0..m {
+            for j in 0..n {
+                let mut best = f64::INFINITY;
+                let mut acc: i64 = 0;
+                for kk in 0..k {
+                    let v = a_val[i*k + kk] + b_val[kk*n + j];
+                    if v < best {
+                        best = v;
+                        acc = (a_cnt[i*k + kk] as i64) * (b_cnt[kk*n + j] as i64) % 11;
+                    } else if v == best {
+                        acc = (acc + (a_cnt[i*k + kk] as i64) * (b_cnt[kk*n + j] as i64)) % 11;
+                    }
+                }
+                assert_eq!(out_val[i*n + j], best, "value mismatch at ({},{})", i, j);
+                assert_eq!(out_cnt[i*n + j] as i64, acc, "count mismatch at ({},{})", i, j);
+            }
+        }
+    }
+
+    #[test]
+    fn matmul_mod_p_pair_4x4_min_random_p11() {
+        use tropical_gemm::types::Min;
+        use crate::pair::PairF64;
+        let ctx = crate::get_global_context().expect("CUDA ctx");
+        let m = 4usize; let k = 6usize; let n = 4usize;
+
+        // Same input pattern as matmul_mod_p_4x4_min_random_p11 — pack into PairF64
+        // up front and route through the fast path. Result must match.
+        let a_val: Vec<f64> = (0..m*k).map(|i| (i % 5) as f64).collect();
+        let a_cnt: Vec<i32> = (0..m*k).map(|i| ((i + 1) % 11) as i32).collect();
+        let b_val: Vec<f64> = (0..k*n).map(|i| (i % 4) as f64).collect();
+        let b_cnt: Vec<i32> = (0..k*n).map(|i| ((i + 2) % 11) as i32).collect();
+
+        let pair_a: Vec<PairF64> = a_val.iter().zip(a_cnt.iter())
+            .map(|(&v, &c)| PairF64::new(v, c)).collect();
+        let pair_b: Vec<PairF64> = b_val.iter().zip(b_cnt.iter())
+            .map(|(&v, &c)| PairF64::new(v, c)).collect();
+
+        let mut out_val = vec![0.0_f64; m*n];
+        let mut out_cnt = vec![0_i32; m*n];
+        matmul_mod_p_pair::<f64, Min>(
+            ctx, &pair_a, m, k, &pair_b, n, 11,
+            &mut out_val, &mut out_cnt,
+        ).expect("fast-path driver ok");
+
+        // Reference (same as in the slow-path test).
         for i in 0..m {
             for j in 0..n {
                 let mut best = f64::INFINITY;
