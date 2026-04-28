@@ -107,6 +107,83 @@ where
     Ok(())
 }
 
+/// Fast path: caller has already packed into the device-compatible
+/// `PairT` layout. Used by Julia callers whose host-side
+/// `Matrix{CountingTropical{T, Mod{P, Int32}}}` is byte-compatible with
+/// `PairT` and can be reinterpreted with no per-element split.
+///
+/// `pair_a` is M × K row-major; `pair_b` is K × N row-major.
+pub fn matmul_mod_p_pair<T, D>(
+    ctx: &CudaContext,
+    pair_a: &[<T as PackPair>::Pair],
+    m: usize,
+    k: usize,
+    pair_b: &[<T as PackPair>::Pair],
+    n: usize,
+    p: i32,
+    out_val: &mut [T],
+    out_cnt: &mut [i32],
+) -> Result<()>
+where
+    T: tropical_gemm::types::TropicalScalar
+        + DeviceRepr
+        + ValidAsZeroBits
+        + Default
+        + Clone
+        + Copy
+        + PackPair
+        + 'static,
+    D: TropicalDirection,
+    (T, D): CountingCudaKernel<T, D>,
+{
+    if p < P_MIN {
+        return Err(CudaError::InvalidState(format!(
+            "modulus must satisfy {} <= p < 2^31, got {}",
+            P_MIN, p
+        )));
+    }
+    if pair_a.len() != m * k
+        || pair_b.len() != k * n
+        || out_val.len() != m * n
+        || out_cnt.len() != m * n
+    {
+        return Err(CudaError::InvalidState(format!(
+            "buffer length mismatch: m={}, k={}, n={}, but \
+             pair_a={} pair_b={} out_val={} out_cnt={}",
+            m, k, n,
+            pair_a.len(), pair_b.len(), out_val.len(), out_cnt.len()
+        )));
+    }
+    if m == 0 || k == 0 || n == 0 {
+        return Err(CudaError::InvalidState(
+            "dimensions must be non-zero".into(),
+        ));
+    }
+
+    // Upload directly — no host-side pack.
+    let pair_a_dev = GpuMatrix::<<T as PackPair>::Pair>::from_host(ctx, pair_a, m, k)?;
+    let pair_b_dev = GpuMatrix::<<T as PackPair>::Pair>::from_host(ctx, pair_b, k, n)?;
+
+    let mut value_c = GpuMatrix::<T>::alloc(ctx, m, n)?;
+    let mut count_c = GpuMatrix::<i32>::alloc(ctx, m, n)?;
+
+    launch_counting_gemm::<T, D>(
+        ctx,
+        &pair_a_dev,
+        &pair_b_dev,
+        &mut value_c,
+        &mut count_c,
+        p,
+    )?;
+
+    let host_val = value_c.to_host(ctx)?;
+    let host_cnt = count_c.to_host(ctx)?;
+    out_val.copy_from_slice(&host_val);
+    out_cnt.copy_from_slice(&host_cnt);
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,5 +257,68 @@ mod tests {
         let msg = format!("{}", err);
         assert!(msg.contains("modulus") || msg.contains("p"),
             "expected modulus error, got: {}", msg);
+    }
+
+    #[test]
+    fn matmul_mod_p_pair_2x2_max_p7() {
+        // Same setup as the slow-path test, but caller pre-packs into PairF32.
+        use crate::pair::PairF32;
+        let ctx = crate::get_global_context().expect("CUDA ctx");
+        let pair_a = vec![
+            PairF32::new(1.0, 1), PairF32::new(2.0, 1),
+            PairF32::new(3.0, 1), PairF32::new(4.0, 1),
+        ];
+        let pair_b = vec![
+            PairF32::new(5.0, 1), PairF32::new(6.0, 1),
+            PairF32::new(7.0, 1), PairF32::new(8.0, 1),
+        ];
+        let mut out_val = vec![0.0_f32; 4];
+        let mut out_cnt = vec![0_i32; 4];
+
+        matmul_mod_p_pair::<f32, Max>(
+            ctx, &pair_a, 2, 2, &pair_b, 2, 7,
+            &mut out_val, &mut out_cnt,
+        ).expect("driver ok");
+
+        assert_eq!(out_val, vec![9.0_f32, 10.0, 11.0, 12.0]);
+        assert_eq!(out_cnt, vec![1_i32, 1, 1, 1]);
+    }
+
+    #[test]
+    fn matmul_mod_p_4x4_min_random_p11() {
+        use tropical_gemm::types::Min;
+        let ctx = crate::get_global_context().expect("CUDA ctx");
+        let m = 4usize; let k = 6usize; let n = 4usize;
+        // Discrete inputs to force ties.
+        let a_val: Vec<f64> = (0..m*k).map(|i| (i % 5) as f64).collect();
+        let a_cnt: Vec<i32> = (0..m*k).map(|i| ((i + 1) % 11) as i32).collect();
+        let b_val: Vec<f64> = (0..k*n).map(|i| (i % 4) as f64).collect();
+        let b_cnt: Vec<i32> = (0..k*n).map(|i| ((i + 2) % 11) as i32).collect();
+
+        let mut out_val = vec![0.0_f64; m*n];
+        let mut out_cnt = vec![0_i32; m*n];
+        matmul_mod_p::<f64, Min>(
+            ctx, &a_val, &a_cnt, m, k, &b_val, &b_cnt, n, 11,
+            &mut out_val, &mut out_cnt,
+        ).expect("driver ok");
+
+        // Reference.
+        for i in 0..m {
+            for j in 0..n {
+                let mut best = f64::INFINITY;
+                let mut acc: i64 = 0;
+                for kk in 0..k {
+                    let v = a_val[i*k + kk] + b_val[kk*n + j];
+                    if v < best {
+                        best = v;
+                        acc = (a_cnt[i*k + kk] as i64) * (b_cnt[kk*n + j] as i64) % 11;
+                    } else if v == best {
+                        acc = (acc + (a_cnt[i*k + kk] as i64) * (b_cnt[kk*n + j] as i64)) % 11;
+                    }
+                }
+                assert_eq!(out_val[i*n + j], best, "value mismatch at ({},{})", i, j);
+                assert_eq!(out_cnt[i*n + j] as i64, acc, "count mismatch at ({},{})", i, j);
+            }
+        }
     }
 }
