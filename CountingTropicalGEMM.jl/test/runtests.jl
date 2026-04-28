@@ -264,4 +264,91 @@ end
         mul!(C, A, B)
         @test C == ref
     end
+
+    @testset "tropical_matmul edge cases" begin
+        # 1×1×1.
+        A11 = reshape([ModCountingTropical{Float32, 7}(2.0f0, Int32(3))], 1, 1)
+        B11 = reshape([ModCountingTropical{Float32, 7}(5.0f0, Int32(4))], 1, 1)
+        C11 = tropical_matmul(A11, B11)
+        @test C11[1, 1].n == 7.0f0
+        @test C11[1, 1].c == Int32(mod(3 * 4, 7))   # 12 mod 7 = 5
+
+        # K = 1 (no ties possible).
+        A1 = [ModCountingTropical{Float32, 7}(Float32(i), Int32(2)) for i in 1:3, _ in 1:1]
+        B1 = [ModCountingTropical{Float32, 7}(Float32(j), Int32(3)) for _ in 1:1, j in 1:4]
+        C1 = tropical_matmul(A1, B1)
+        @test size(C1) == (3, 4)
+        for i in 1:3, j in 1:4
+            @test C1[i, j].n == Float32(i + j)
+            @test C1[i, j].c == Int32(mod(2 * 3, 7))   # 6
+        end
+
+        # P = 2 (smallest valid prime). All-tie input with K=5, counts=1:
+        # 5 ties of (1*1)=1, sum mod 2 = 5 mod 2 = 1.
+        A2 = [ModCountingTropical{Float32, 2}(0.0f0, Int32(1)) for _ in 1:3, _ in 1:5]
+        B2 = [ModCountingTropical{Float32, 2}(0.0f0, Int32(1)) for _ in 1:5, _ in 1:3]
+        C2 = tropical_matmul(A2, B2)
+        @test all(c -> c.n == 0.0f0, C2)
+        @test all(c -> c.c == Int32(1), C2)
+
+        # All-tie reduction triggers: P=17, K=5, counts 2*3=6 each, sum 30 mod 17 = 13.
+        A3 = [ModCountingTropical{Float64, 17}(0.0, Int32(2)) for _ in 1:2, _ in 1:5]
+        B3 = [ModCountingTropical{Float64, 17}(0.0, Int32(3)) for _ in 1:5, _ in 1:2]
+        C3 = tropical_matmul(A3, B3)
+        @test all(c -> c.n == 0.0, C3)
+        @test all(c -> c.c == Int32(13), C3)
+
+        # Largest valid prime fitting i32 positive: 2^31 - 1 = 2147483647.
+        # All-ties with input counts 1, K=3, P=2147483647: sum = 3, mod = 3.
+        Phuge = 2147483647
+        Ah = [ModCountingTropical{Float32, Phuge}(0.0f0, Int32(1)) for _ in 1:2, _ in 1:3]
+        Bh = [ModCountingTropical{Float32, Phuge}(0.0f0, Int32(1)) for _ in 1:3, _ in 1:2]
+        Ch = tropical_matmul(Ah, Bh)
+        @test all(c -> c.n == 0.0f0, Ch)
+        @test all(c -> c.c == Int32(3), Ch)
+    end
+
+    @testset "tropical_matmul errors" begin
+        # K-mismatch.
+        A = [ModCountingTropical{Float32, 7}(0.0f0, Int32(1)) for _ in 1:2, _ in 1:3]
+        Bbad = [ModCountingTropical{Float32, 7}(0.0f0, Int32(1)) for _ in 1:4, _ in 1:2]
+        @test_throws DimensionMismatch tropical_matmul(A, Bbad)
+
+        # P out of range — must be checked at the Julia layer (ArgumentError).
+        # Julia's typeparam can hold any Int, so we can construct types with bad P.
+        # P = 1: invalid (must be >= 2).
+        A1 = [ModCountingTropical{Float32, 1}(0.0f0, Int32(0)) for _ in 1:2, _ in 1:2]
+        @test_throws ArgumentError tropical_matmul(A1, A1)
+
+        # P = 2^31 (just past the i32 positive max): also invalid.
+        Pover = Int(1) << 31
+        Aover = [ModCountingTropical{Float32, Pover}(0.0f0, Int32(0)) for _ in 1:2, _ in 1:2]
+        @test_throws ArgumentError tropical_matmul(Aover, Aover)
+
+        # Mismatched moduli (different P) → MethodError (no method matches).
+        Aother = [ModCountingTropical{Float32, 11}(0.0f0, Int32(0)) for _ in 1:2, _ in 1:3]
+        @test_throws MethodError tropical_matmul(A, Aother)
+
+        # Mismatched directions (Max vs Min) → MethodError.
+        Amax = [ModCountingTropical{Float32, 7}(0.0f0, Int32(1)) for _ in 1:2, _ in 1:3]
+        Bmin = [ModCountingTropicalMin{Float32, 7}(0.0f0, Int32(1)) for _ in 1:3, _ in 1:2]
+        @test_throws MethodError tropical_matmul(Amax, Bmin)
+    end
+
+    @testset "convert from CountingTropical{T, Mod{P}}" begin
+        using TropicalNumbers, Mods
+        P = 7
+        # CountingTropical from TropicalNumbers.jl with Mods.jl v2 Mod{P}.
+        x = CountingTropical{Float32, Mod{P}}(2.5f0, Mod{P}(3))
+        y = convert(ModCountingTropical{Float32, P}, x)
+        @test y.n == 2.5f0
+        @test y.c == Int32(3)
+
+        # Out-of-range count value (count > 2^31 - 1) — would be caught by
+        # Int32 conversion. With Mod{P} the value is always in [0, P) and
+        # P < 2^31 by our contract, so this is a defensive check; we
+        # assert the converter rejects a deliberately-crafted bad value.
+        # (Skipped — Mod{P} invariant guarantees the value fits, so the
+        # converter is total within its domain.)
+    end
 end

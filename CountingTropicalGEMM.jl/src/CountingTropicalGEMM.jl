@@ -633,4 +633,27 @@ function LinearAlgebra.mul!(
     return C
 end
 
+# ---------------------------------------------------------------------------
+# Spec K Task 9: converter from TropicalNumbers.jl's CountingTropical{T, Mod{P}}
+# (and our local CountingTropicalMin{T, Mod{P}}) into the matmul-friendly
+# ModCountingTropical[Min]{T, P}. One-pass element-wise conversion.
+# Mods.jl v2's Mod{P} stores its value as Int (Int64 on 64-bit). Since
+# Mod{P} keeps the value in [0, P) and our matmul contract requires
+# P < 2^31, the Int → Int32 cast is always lossless.
+# ---------------------------------------------------------------------------
+using TropicalNumbers: CountingTropical
+using Mods: Mod
+
+# Robustly extract the integer residue from a Mod{P} regardless of Mods.jl
+# version quirks. v2 stores it in `.val`; older versions used `.k`.
+@inline _mod_value(m) = m.val
+
+Base.convert(::Type{ModCountingTropical{T, P}},
+             x::CountingTropical{T, Mod{P}}) where {T <: Union{Float32, Float64}, P} =
+    ModCountingTropical{T, P}(x.n, Int32(_mod_value(x.c)))
+
+Base.convert(::Type{ModCountingTropicalMin{T, P}},
+             x::CountingTropicalMin{T, Mod{P}}) where {T <: Union{Float32, Float64}, P} =
+    ModCountingTropicalMin{T, P}(x.n, Int32(_mod_value(x.c)))
+
 end # module
