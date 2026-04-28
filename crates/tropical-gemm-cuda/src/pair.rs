@@ -46,52 +46,6 @@ unsafe impl DeviceRepr for PairF64 {}
 unsafe impl ValidAsZeroBits for PairF32 {}
 unsafe impl ValidAsZeroBits for PairF64 {}
 
-/// Pack a row-major `(values, counts)` pair of slices into a `Vec<PairF32>`.
-/// Single-pass O(n). Used by the counting driver to convert all-ones-counts
-/// inputs to AoS form once before the per-prime kernel launches.
-pub fn pack_f32(values: &[f32], counts: &[i32]) -> Vec<PairF32> {
-    debug_assert_eq!(values.len(), counts.len());
-    values.iter().zip(counts.iter()).map(|(&v, &c)| PairF32::new(v, c)).collect()
-}
-
-/// Variant for the all-ones-counts case (the only entry point today).
-pub fn pack_f32_ones(values: &[f32]) -> Vec<PairF32> {
-    values.iter().map(|&v| PairF32::new(v, 1)).collect()
-}
-
-pub fn pack_f64(values: &[f64], counts: &[i32]) -> Vec<PairF64> {
-    debug_assert_eq!(values.len(), counts.len());
-    values.iter().zip(counts.iter()).map(|(&v, &c)| PairF64::new(v, c)).collect()
-}
-
-pub fn pack_f64_ones(values: &[f64]) -> Vec<PairF64> {
-    values.iter().map(|&v| PairF64::new(v, 1)).collect()
-}
-
-/// Trait abstracting `T -> PairT` packing so the counting driver can be
-/// generic over scalar type. Each scalar's pair type implements this.
-pub trait PackPair: Copy {
-    type Pair: DeviceRepr + ValidAsZeroBits + Default + Clone + Copy + 'static;
-    fn pack_ones(values: &[Self]) -> Vec<Self::Pair>;
-    fn pack_pair(values: &[Self], counts: &[i32]) -> Vec<Self::Pair>;
-}
-
-impl PackPair for f32 {
-    type Pair = PairF32;
-    fn pack_ones(values: &[Self]) -> Vec<Self::Pair> { pack_f32_ones(values) }
-    fn pack_pair(values: &[Self], counts: &[i32]) -> Vec<Self::Pair> {
-        pack_f32(values, counts)
-    }
-}
-
-impl PackPair for f64 {
-    type Pair = PairF64;
-    fn pack_ones(values: &[Self]) -> Vec<Self::Pair> { pack_f64_ones(values) }
-    fn pack_pair(values: &[Self], counts: &[i32]) -> Vec<Self::Pair> {
-        pack_f64(values, counts)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -124,36 +78,4 @@ mod tests {
         assert_eq!(p._pad, 0);
     }
 
-    #[test]
-    fn pack_roundtrip_f32() {
-        let v = vec![1.0_f32, 2.0, 3.0, 4.0];
-        let c = vec![10_i32, 20, 30, 40];
-        let packed = pack_f32(&v, &c);
-        for (i, p) in packed.iter().enumerate() {
-            assert_eq!(p.val, v[i]);
-            assert_eq!(p.cnt, c[i]);
-        }
-    }
-
-    #[test]
-    fn pack_ones_f32() {
-        let v = vec![5.0_f32, 7.5, -1.25];
-        let packed = pack_f32_ones(&v);
-        for (i, p) in packed.iter().enumerate() {
-            assert_eq!(p.val, v[i]);
-            assert_eq!(p.cnt, 1);
-        }
-    }
-
-    #[test]
-    fn pack_roundtrip_f64() {
-        let v = vec![1.0_f64, 2.0, 3.0];
-        let c = vec![100_i32, 200, 300];
-        let packed = pack_f64(&v, &c);
-        for (i, p) in packed.iter().enumerate() {
-            assert_eq!(p.val, v[i]);
-            assert_eq!(p.cnt, c[i]);
-            assert_eq!(p._pad, 0);
-        }
-    }
 }

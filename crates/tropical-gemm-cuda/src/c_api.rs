@@ -85,7 +85,6 @@ where
         + cudarc::driver::DeviceRepr
         + cudarc::driver::ValidAsZeroBits
         + Default + Clone + Copy
-        + crate::pair::PackPair
         + 'static,
     D: tropical_gemm::types::TropicalDirection,
     (T, D): crate::counting_kernel::TropicalMatmulKernelName<T, D>,

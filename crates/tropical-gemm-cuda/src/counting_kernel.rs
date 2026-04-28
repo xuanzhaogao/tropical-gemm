@@ -50,7 +50,6 @@ where
         + cudarc::driver::DeviceRepr
         + cudarc::driver::ValidAsZeroBits
         + Default + Clone + Copy
-        + crate::pair::PackPair
         + 'static,
     D: tropical_gemm::types::TropicalDirection,
     (T, D): TropicalMatmulKernelName<T, D>,

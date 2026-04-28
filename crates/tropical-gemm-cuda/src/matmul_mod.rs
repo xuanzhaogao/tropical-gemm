@@ -10,7 +10,6 @@ use tropical_gemm::types::TropicalDirection;
 
 use crate::context::CudaContext;
 use crate::error::{CudaError, Result};
-use crate::pair::PackPair;
 
 /// Minimum allowed modulus. The kernel takes `i32` modulus, so `p` must fit
 /// in positive `i32`. `p == 1` collapses every count to zero (degenerate);
@@ -37,7 +36,6 @@ where
         + DeviceRepr
         + ValidAsZeroBits
         + Default + Clone + Copy
-        + PackPair
         + 'static,
     D: TropicalDirection,
     (T, D): crate::counting_kernel::TropicalMatmulKernelName<T, D>,
