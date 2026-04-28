@@ -27,6 +27,7 @@ using Libdl
 export Max, Min, CountedMatU64, TropicalMatrix
 export count_ground_states_gpu_u64, bench_kernel_only_u64
 export CountingTropicalGEMMError, BoundTooLargeError
+export ModCountingTropical, ModCountingTropicalMin
 
 # ---------------------------------------------------------------------------
 # Direction tags. Match the Rust `Max` / `Min` marker types.
@@ -337,5 +338,105 @@ Base.:(==)(a::CountingTropicalMin, b::CountingTropicalMin) =
     a.n == b.n && a.c == b.c
 
 export CountingTropicalMin
+
+# ---------------------------------------------------------------------------
+# AoS counting tropical types matching the Rust PairT layout exactly.
+# Used by tropical_matmul (Spec K Task 7+) for zero-copy reinterpret across
+# the FFI boundary. PairF32/PairF64 are internal aliases used only when
+# constructing the typed pointer in ccall — never exported.
+# ---------------------------------------------------------------------------
+struct PairF32
+    val::Float32
+    cnt::Int32
+end
+struct PairF64
+    val::Float64
+    cnt::Int32
+    _pad::Int32
+end
+
+# Map T → PairT (internal).
+_pair_type(::Type{Float32}) = PairF32
+_pair_type(::Type{Float64}) = PairF64
+
+"""
+    ModCountingTropical{T, P}(n::T, c::Int32)
+
+Max-plus counting tropical number with count reduced mod `P`. Layout
+matches the Rust `PairT` struct exactly: `n::T` followed by `c::Int32`
+(plus 4 B padding when `T == Float64`). Constructed in user code so
+matmul can reinterpret a `Matrix{ModCountingTropical{T, P}}` as a
+`Matrix{PairT}` with no per-element copy.
+
+`T ∈ {Float32, Float64}`. `P` is the modulus (compile-time `Int`,
+must satisfy 2 <= P < 2^31). Counts are stored as `Int32` in `[0, P)`.
+"""
+struct ModCountingTropical{T, P}
+    n::T
+    c::Int32
+end
+
+"""
+    ModCountingTropicalMin{T, P}(n::T, c::Int32)
+
+Min-plus counterpart of `ModCountingTropical`. Same layout and
+constraints; `+` takes the smaller `n`.
+"""
+struct ModCountingTropicalMin{T, P}
+    n::T
+    c::Int32
+end
+
+# --- Max-plus semiring ---
+
+Base.zero(::Type{ModCountingTropical{T, P}}) where {T, P} =
+    ModCountingTropical{T, P}(typemin(T), Int32(0))
+Base.one(::Type{ModCountingTropical{T, P}}) where {T, P} =
+    ModCountingTropical{T, P}(zero(T), Int32(1))
+
+function Base.:+(a::ModCountingTropical{T, P}, b::ModCountingTropical{T, P}) where {T, P}
+    if a.n > b.n
+        a
+    elseif b.n > a.n
+        b
+    else
+        ModCountingTropical{T, P}(a.n,
+            Int32(mod(Int64(a.c) + Int64(b.c), Int64(P))))
+    end
+end
+
+function Base.:*(a::ModCountingTropical{T, P}, b::ModCountingTropical{T, P}) where {T, P}
+    ModCountingTropical{T, P}(a.n + b.n,
+        Int32(mod(Int64(a.c) * Int64(b.c), Int64(P))))
+end
+
+Base.:(==)(a::ModCountingTropical, b::ModCountingTropical) =
+    a.n == b.n && a.c == b.c
+
+# --- Min-plus semiring ---
+
+Base.zero(::Type{ModCountingTropicalMin{T, P}}) where {T, P} =
+    ModCountingTropicalMin{T, P}(typemax(T), Int32(0))
+Base.one(::Type{ModCountingTropicalMin{T, P}}) where {T, P} =
+    ModCountingTropicalMin{T, P}(zero(T), Int32(1))
+
+function Base.:+(a::ModCountingTropicalMin{T, P}, b::ModCountingTropicalMin{T, P}) where {T, P}
+    if a.n < b.n
+        a
+    elseif b.n < a.n
+        b
+    else
+        ModCountingTropicalMin{T, P}(a.n,
+            Int32(mod(Int64(a.c) + Int64(b.c), Int64(P))))
+    end
+end
+
+function Base.:*(a::ModCountingTropicalMin{T, P}, b::ModCountingTropicalMin{T, P}) where {T, P}
+    ModCountingTropicalMin{T, P}(a.n + b.n,
+        Int32(mod(Int64(a.c) * Int64(b.c), Int64(P))))
+end
+
+Base.:(==)(a::ModCountingTropicalMin, b::ModCountingTropicalMin) =
+    a.n == b.n && a.c == b.c
 
 end # module

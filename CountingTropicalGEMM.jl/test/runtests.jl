@@ -121,4 +121,50 @@ end
         @test res.values == Float32[9 10; 11 12]
         @test res.counts == UInt64[1 1; 1 1]
     end
+
+    @testset "ModCountingTropical type and semiring" begin
+        # Layout: must be byte-compatible with the Rust PairT.
+        @test sizeof(ModCountingTropical{Float32, 7}) == 8
+        @test sizeof(ModCountingTropical{Float64, 7}) == 16
+        @test sizeof(ModCountingTropicalMin{Float32, 7}) == 8
+        @test sizeof(ModCountingTropicalMin{Float64, 7}) == 16
+
+        # Semiring identities.
+        Z = zero(ModCountingTropical{Float32, 7})
+        O = one(ModCountingTropical{Float32, 7})
+        @test Z.n == typemin(Float32) && Z.c == Int32(0)
+        @test O.n == 0.0f0 && O.c == Int32(1)
+
+        # Max-plus addition: take greater n; sum counts on tie mod P.
+        a = ModCountingTropical{Float32, 7}(1.0f0, Int32(3))
+        b = ModCountingTropical{Float32, 7}(2.0f0, Int32(5))
+        c = ModCountingTropical{Float32, 7}(1.0f0, Int32(6))
+        @test a + b == b
+        @test b + a == b
+        @test a + c == ModCountingTropical{Float32, 7}(1.0f0, Int32(2))   # 3+6=9 mod 7 = 2
+
+        # Tropical mul: sum n, multiply counts mod P.
+        d = ModCountingTropical{Float32, 7}(2.0f0, Int32(4))
+        e = ModCountingTropical{Float32, 7}(3.0f0, Int32(5))
+        @test d * e == ModCountingTropical{Float32, 7}(5.0f0, Int32(6))   # 4*5=20 mod 7 = 6
+
+        # Min-plus mirror.
+        Zm = zero(ModCountingTropicalMin{Float64, 11})
+        Om = one(ModCountingTropicalMin{Float64, 11})
+        @test Zm.n == typemax(Float64) && Zm.c == Int32(0)
+        @test Om.n == 0.0 && Om.c == Int32(1)
+
+        am = ModCountingTropicalMin{Float64, 11}(1.0, Int32(3))
+        bm = ModCountingTropicalMin{Float64, 11}(2.0, Int32(5))
+        cm = ModCountingTropicalMin{Float64, 11}(1.0, Int32(9))
+        @test am + bm == am          # min picks 1.0
+        @test am + cm == ModCountingTropicalMin{Float64, 11}(1.0, Int32(1))  # 3+9=12 mod 11 = 1
+        @test am * bm == ModCountingTropicalMin{Float64, 11}(3.0, Int32(4))  # 3*5=15 mod 11 = 4
+
+        # Int32 overflow guard: counts near (2^31 - 1) must stay correct via Int64 path.
+        big1 = ModCountingTropical{Float32, 2_000_000_011}(0.0f0, Int32(2_000_000_000))
+        big2 = ModCountingTropical{Float32, 2_000_000_011}(0.0f0, Int32(2_000_000_000))
+        expected = Int32(mod(Int64(2_000_000_000)^2, Int64(2_000_000_011)))
+        @test (big1 * big2).c == expected
+    end
 end
