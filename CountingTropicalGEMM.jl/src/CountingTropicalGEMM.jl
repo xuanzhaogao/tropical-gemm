@@ -179,6 +179,17 @@ Base.:(==)(a::ModCountingTropical, b::ModCountingTropical) =
 
 # --- Min-plus semiring ---
 
+# Tuple-style display with unicode subscripts: value carries '+' or '-'
+# (max-plus / min-plus); count carries the modulus P.
+# Examples: (3.0₊, 2₇)   (1.5₋, 4₁₁)
+const _SUBSCRIPT_DIGITS = ('₀','₁','₂','₃','₄','₅','₆','₇','₈','₉')
+_subscript_int(n::Integer) = join(_SUBSCRIPT_DIGITS[d - '0' + 1] for d in string(n))
+
+function Base.show(io::IO, x::ModCountingTropical{T, P}) where {T, P}
+    print(io, "(", x.n, "₊, ", x.c, _subscript_int(P), ")")
+end
+Base.show(io::IO, ::MIME"text/plain", x::ModCountingTropical) = show(io, x)
+
 Base.zero(::Type{ModCountingTropicalMin{T, P}}) where {T, P} =
     ModCountingTropicalMin{T, P}(typemax(T), Int32(0))
 Base.one(::Type{ModCountingTropicalMin{T, P}}) where {T, P} =
@@ -202,6 +213,11 @@ end
 
 Base.:(==)(a::ModCountingTropicalMin, b::ModCountingTropicalMin) =
     a.n == b.n && a.c == b.c
+
+function Base.show(io::IO, x::ModCountingTropicalMin{T, P}) where {T, P}
+    print(io, "(", x.n, "₋, ", x.c, _subscript_int(P), ")")
+end
+Base.show(io::IO, ::MIME"text/plain", x::ModCountingTropicalMin) = show(io, x)
 
 # ---------------------------------------------------------------------------
 # Spec M: column-major BLAS-style mod-P counting tropical GEMM.
