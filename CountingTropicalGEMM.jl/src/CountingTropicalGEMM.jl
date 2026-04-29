@@ -25,6 +25,7 @@ module CountingTropicalGEMM
 
 using CUDA
 using Libdl
+using LinearAlgebra: LinearAlgebra
 
 export ModCountingTropical, ModCountingTropicalMin
 export tropical_matmul, tropical_matmul!
@@ -177,6 +178,12 @@ end
 Base.:(==)(a::ModCountingTropical, b::ModCountingTropical) =
     a.n == b.n && a.c == b.c
 
+# OMEinsum's CUDAExt simplify path scales tensors by Bool flags during
+# permutation; provide identity / zero shortcut so the GPU broadcast
+# compiles without falling back to dynamic dispatch.
+Base.:*(b::Bool, x::ModCountingTropical) = b ? x : zero(typeof(x))
+Base.:*(x::ModCountingTropical, b::Bool) = b ? x : zero(typeof(x))
+
 # --- Min-plus semiring ---
 
 # Tuple-style display with unicode subscripts: value carries '+' or '-'
@@ -213,6 +220,9 @@ end
 
 Base.:(==)(a::ModCountingTropicalMin, b::ModCountingTropicalMin) =
     a.n == b.n && a.c == b.c
+
+Base.:*(b::Bool, x::ModCountingTropicalMin) = b ? x : zero(typeof(x))
+Base.:*(x::ModCountingTropicalMin, b::Bool) = b ? x : zero(typeof(x))
 
 function Base.show(io::IO, x::ModCountingTropicalMin{T, P}) where {T, P}
     print(io, "(", x.n, "₋, ", x.c, _subscript_int(P), ")")
@@ -349,6 +359,102 @@ function tropical_matmul!(tA::Char, tB::Char,
     _spec_m_call(T, Val(:min), tA, tB, M, K, N, P,
                  _spec_m_u64ptr(A), _spec_m_u64ptr(B), _spec_m_u64ptr(C))
     return C
+end
+
+# ---------------------------------------------------------------------------
+# LinearAlgebra.mul! overloads — let OMEinsum (and any user code that calls
+# `A * B` or `mul!(C, A, B)`) dispatch onto our tiled GPU kernel
+# transparently. Only the 3-arg form is overloaded; counting tropical has
+# no scalar α/β semantics for the 5-arg form.
+# ---------------------------------------------------------------------------
+
+# Common element type alias.
+const _ModTropElt{T, P} = Union{ModCountingTropical{T, P}, ModCountingTropicalMin{T, P}}
+
+# Override LinearAlgebra.generic_matmatmul! and generic_matvecmul! at the
+# AbstractChar-flag level (the chain GPUArrays takes for any non-BLAS
+# eltype). With a concrete element-type bound, our methods win specificity
+# over GPUArrays' AbstractArray-typed fallbacks, and we collapse all four
+# (tA, tB) flags into a single tropical_matmul! call.
+
+function LinearAlgebra.generic_matmatmul!(
+    C::CuMatrix{E},
+    tA::AbstractChar,
+    tB::AbstractChar,
+    A::CuMatrix{E},
+    B::CuMatrix{E},
+    α::Number, β::Number,
+) where {E <: _ModTropElt}
+    _check_alpha_beta(α, β, E)
+    tropical_matmul!(_normflag(tA), _normflag(tB), A, B, C)
+    return C
+end
+function LinearAlgebra.generic_matmatmul!(
+    C::CuMatrix{E},
+    tA::AbstractChar,
+    tB::AbstractChar,
+    A::CuMatrix{E},
+    B::CuMatrix{E},
+    add::LinearAlgebra.MulAddMul,
+) where {E <: _ModTropElt}
+    _check_alpha_beta(add.alpha, add.beta, E)
+    tropical_matmul!(_normflag(tA), _normflag(tB), A, B, C)
+    return C
+end
+
+# Vector cases come through generic_matvecmul!. Reshape the vector to a
+# single-column matrix and reuse the matrix kernel.
+function LinearAlgebra.generic_matvecmul!(
+    C::CuVector{E},
+    tA::AbstractChar,
+    A::CuMatrix{E},
+    B::CuVector{E},
+    α::Number, β::Number,
+) where {E <: _ModTropElt}
+    _check_alpha_beta(α, β, E)
+    Bm = reshape(B, length(B), 1)
+    Cm = reshape(C, length(C), 1)
+    tropical_matmul!(_normflag(tA), 'N', A, Bm, Cm)
+    return C
+end
+function LinearAlgebra.generic_matvecmul!(
+    C::CuVector{E},
+    tA::AbstractChar,
+    A::CuMatrix{E},
+    B::CuVector{E},
+    add::LinearAlgebra.MulAddMul,
+) where {E <: _ModTropElt}
+    _check_alpha_beta(add.alpha, add.beta, E)
+    Bm = reshape(B, length(B), 1)
+    Cm = reshape(C, length(C), 1)
+    tropical_matmul!(_normflag(tA), 'N', A, Bm, Cm)
+    return C
+end
+
+# Plain `A * B` (no preallocated C): allocate output and route to mat-mat
+# or mat-vec kernel. Covers OMEinsum's `*` use in non-mul! rules.
+function Base.:*(A::CuMatrix{E}, B::CuMatrix{E}) where {E <: _ModTropElt}
+    C = CuArray{E}(undef, size(A, 1), size(B, 2))
+    tropical_matmul!('N', 'N', A, B, C)
+    return C
+end
+function Base.:*(A::CuMatrix{E}, B::CuVector{E}) where {E <: _ModTropElt}
+    Bm = reshape(B, length(B), 1)
+    C = CuArray{E}(undef, size(A, 1))
+    tropical_matmul!('N', 'N', A, Bm, reshape(C, length(C), 1))
+    return C
+end
+
+# Helpers.
+@inline _normflag(c::AbstractChar) =
+    (c == 'N' || c == 'n') ? 'N' :
+    (c == 'T' || c == 't' || c == 'C' || c == 'c') ? 'T' :
+    error("unexpected transpose flag $c")
+
+@inline function _check_alpha_beta(α, β, ::Type{E}) where {E}
+    α === true || α == 1 || error("$(E) mul!: α=$(α) unsupported (only α=true)")
+    β === false || β == 0 || error("$(E) mul!: β=$(β) unsupported (only β=false; would need tropical-add merge)")
+    return nothing
 end
 
 end # module
