@@ -147,6 +147,56 @@ Run on `workergpu049`.
 - **Cross-flag spread on A100 mirrors RTX 6000** — within ~5% of each
   other at every size. Layout-aware loading carries over cleanly.
 
+## A100-SXM4-80GB (Spec P pipelined-structure) — 2026-04-29
+
+Double-buffered shared-memory layout (BM=BN=64, **BK=16**, TM=TN=4 for
+f32; 2 stages). Dispatched on sm_80+ via runtime compute-cap check.
+
+| Shape | flag | ms / call | G tropical-ops/s |
+|---:|:---:|---:|---:|
+| 512³ | NN | 0.735 | 365.4 |
+| 512³ | NT | 0.716 | 375.1 |
+| 512³ | TN | 0.715 | 375.4 |
+| 512³ | TT | 0.722 | 371.6 |
+| 1024³ | NN | 4.020 | 534.2 |
+| 1024³ | NT | 3.617 | 593.7 |
+| 1024³ | TN | 3.616 | 593.9 |
+| 1024³ | TT | 3.632 | 591.2 |
+| 2048³ | NN | 23.592 | 728.2 |
+| 2048³ | NT | 23.682 | 725.4 |
+| 2048³ | TN | 23.681 | 725.5 |
+| 2048³ | TT | 23.614 | 727.5 |
+| 4096³ | NN | 178.494 | 770.0 |
+| 4096³ | NT | 179.075 | 767.5 |
+| 4096³ | TN | 179.071 | 767.5 |
+| 4096³ | TT | 178.245 | **771.1** |
+
+### Spec P status
+
+- **Structural pipeline only — cp.async NOT delivered.** Initial cp.async
+  variants (both `.cg` and `.ca`, both per-field and packed-pair
+  encodings) produced silently-corrupt outputs on sm_80 in this kernel
+  layout. The byte-equal sync-vs-pipelined tests caught it before any
+  perf claim could be made. Root cause not pinned to a documented PTX
+  rule. Mitigation: keep the double-buffered shared layout +
+  `__syncthreads()` placement, use plain LDG+STS for the loads.
+  `CP_ASYNC_COMMIT` / `WAIT_GROUP` calls remain as no-ops to preserve
+  the pipeline shape for future re-introduction via `cuda::pipeline` /
+  `__pipeline_memcpy_async`.
+- **Net A100 effect:** **771 G/s** at 4096³ TT vs **746 G/s** for the
+  Spec N sync-only kernel = +3% from the double-buffer shape alone.
+  At 2048³ the pipelined structure gains ~4% (700 → 728 G/s).
+- All four (tA, tB) layouts within ~1% of each other (down from the ~5%
+  spread on Spec N).
+- 75/75 lib tests pass on A100 (70 Spec N + 5 byte-equal `pl_matches_sync_*`
+  fanned across NN/NT/TN/TT = 20 layout comparisons).
+
+The cp.async optimization is **deferred to Spec P.1**: rewrite the loader
+using the higher-level `cuda::pipeline` async API rather than raw inline
+PTX, which the implementation experience suggests has subtle interactions
+with the multi-buffer shared-memory layout we couldn't diagnose at the
+PTX level.
+
 ## H100
 
 Pending — no H100 available at the time of writing. Re-run on A100-80GB
