@@ -227,6 +227,13 @@ struct __align__(16) PairF64 { double val; int cnt; int _pad; };
 // operand (As_v[2][...], etc.) ping-pong: while the compute phase reads
 // buffer cur, the loader prefetches the next K-tile into buffer 1-cur.
 //
+// Out-of-range loader lanes write the (INIT_VAL, 0) sentinel directly
+// to shared memory (plain STS) instead of issuing cp.async — cp.async
+// can't synthesize arbitrary fill bytes. Both store kinds become
+// visible to peer threads at the SAME `__syncthreads()` after
+// `CP_ASYNC_WAIT_GROUP(1)`, so there's no visibility race between the
+// sentinel STS and the cp.async writes that share a buffer.
+//
 // Pipeline layout (NUM_STAGES = 2):
 //   prefetch tile 0 -> buffer 0 -> commit
 //   for kk = BK; kk < K; kk += BK:
@@ -357,8 +364,7 @@ struct __align__(16) PairF64 { double val; int cnt; int _pad; };
         CP_ASYNC_WAIT_GROUP(1);                                                \
         __syncthreads();                                                       \
                                                                                \
-        int kk_prev_end = (BK_);                                               \
-        compute_on(cur_buf, kk_prev_end);                                      \
+        compute_on(cur_buf, (BK_));                                            \
                                                                                \
         __syncthreads();                                                       \
         cur_buf = next_buf;                                                    \
