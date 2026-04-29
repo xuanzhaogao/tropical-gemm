@@ -258,12 +258,6 @@ end
 # how much margin we want over the expected count.
 # ---------------------------------------------------------------------------
 
-# Largest reduction dim K we expect to see in any single matmul step of
-# the OMEinsum contraction. For grid problems with bond dim 2 the
-# practical K rarely exceeds 2^20; raise this if a particular problem
-# shows kernel rejection.
-const K_MAX_LOG2 = 18
-
 function _is_prime(n::Integer)
     n < 2 && return false
     n < 4 && return true
@@ -284,20 +278,72 @@ function _prev_prime(n::Integer)
     return p
 end
 
-# Pick two distinct primes (P1 > P2) maximally below the fast-path
-# envelope. Both satisfy K_max · (P-1)² < 2^63, so the GPU kernel runs
-# the defer-mod fast path. Caller checks P1·P2 > expected count.
-function pick_fast_crt_primes(k_max_log2::Integer = K_MAX_LOG2)
-    # P-1 < floor(sqrt(2^63 / K_max))
-    pmax = isqrt(Int128(1) << (63 - k_max_log2))
-    pmax = min(pmax, Int128(2)^31 - 1)
-    p1 = _prev_prime(Int(pmax))
-    p2 = _prev_prime(p1 - 2)
-    return p1, p2
+# Walk an OMEinsum NestedEinsum / SlicedEinsum tree and return the
+# largest reduction-dimension K that any single matmul step will see.
+# K = product of sizes of indices that are contracted at that step
+# (appear in any input but not in the step's output).
+function max_contraction_k(code, sizes::AbstractDict)
+    if code isa OMEinsum.DynamicNestedEinsum || code isa OMEinsum.NestedEinsum
+        if isempty(code.args)
+            return 1
+        end
+        ixs = OMEinsum.getixsv(code.eins)
+        iy = OMEinsum.getiyv(code.eins)
+        contracted = setdiff(union(ixs...), iy)
+        k_here = isempty(contracted) ? 1 : prod(sizes[i] for i in contracted)
+        k_subs = maximum(max_contraction_k(c, sizes) for c in code.args)
+        return max(k_here, k_subs)
+    elseif code isa OMEinsum.SlicedEinsum
+        return max_contraction_k(code.eins, sizes)
+    else
+        return 1
+    end
 end
 
-const _P1, _P2 = pick_fast_crt_primes(K_MAX_LOG2)
-@assert gcd(_P1, _P2) == 1
+# Greedily pick the largest distinct primes ≤ pmax until product covers
+# `target`. Returns `nothing` if pmax is too small to admit any prime.
+function _greedy_primes(pmax::Int128, target::Int128)
+    pmax < 3 && return nothing
+    primes = Int[]
+    product = Int128(1)
+    p = Int(pmax)
+    while product < target
+        p = _prev_prime(p)
+        p < 3 && break
+        push!(primes, p)
+        product *= p
+        p -= 2
+    end
+    product < target && return nothing
+    return primes, product
+end
+
+# Pick CRT primes adaptively given the largest matmul K in the
+# contraction tree. Returns `(primes, gate, product)` where:
+#   `gate = :u32` → Spec R kernel (~2.85 TG/s on A100), gate K·(P-1)²<2^32
+#   `gate = :u64` → Spec Q kernel (~1.7  TG/s on A100), gate K·(P-1)²<2^63
+# Heuristic: u32 needs ~1.7× more primes for the same envelope but is
+# ~1.7× faster per matmul. Pick u32 when nprimes_u32 ≤ 1.7·nprimes_u64.
+function pick_fast_crt_primes(k_max::Integer; target_envelope_log2::Real = 60)
+    cap = Int128(2)^31 - 1
+    pmax_u32 = min(isqrt((Int128(1) << 32) ÷ Int128(k_max)), cap)
+    pmax_u64 = min(isqrt((Int128(1) << 63) ÷ Int128(k_max)), cap)
+    target = Int128(1) << Int(ceil(target_envelope_log2))
+
+    res_u32 = _greedy_primes(pmax_u32, target)
+    res_u64 = _greedy_primes(pmax_u64, target)
+
+    # If u64 fails the user must broaden K_max or shrink target — in
+    # practice, with cap=2^31-1, u64 envelope is enormous.
+    res_u64 === nothing && error(
+        "cannot cover envelope 2^$target_envelope_log2 with any prime under " *
+        "u64 gate at K_max=$k_max; reduce envelope or increase K_max gate slack")
+
+    if res_u32 !== nothing && length(res_u32[1]) ≤ 1.7 * length(res_u64[1])
+        return res_u32[1], :u32, res_u32[2]
+    end
+    return res_u64[1], :u64, res_u64[2]
+end
 
 function _edge_tensor_for(::Type{E}, J::Float32) where E
     M = Matrix{E}(undef, 2, 2)
@@ -325,7 +371,8 @@ function crt2(r1::Integer, P1::Integer, r2::Integer, P2::Integer)
     return Int128(r1) + Int128(P1) * k
 end
 
-function demo_grid_crt(L::Int; seed::Int = 42, ntrials::Int = 5, niters::Int = 20)
+function demo_grid_crt(L::Int; seed::Int = 42, ntrials::Int = 5, niters::Int = 20,
+                       target_envelope_log2::Real = 60)
     Random.seed!(seed)
     N = L * L
     edge_list = build_grid_edges(L)
@@ -337,21 +384,38 @@ function demo_grid_crt(L::Int; seed::Int = 42, ntrials::Int = 5, niters::Int = 2
     code = OMEinsum.EinCode(edge_label_pairs, Symbol[])
     t_opt = @elapsed optcode = optimize_code(code, uniformsize(code, 2),
         TreeSA(; ntrials, niters))
-    cc = contraction_complexity(optcode, uniformsize(code, 2))
+    sizes = uniformsize(code, 2)
+    cc = contraction_complexity(optcode, sizes)
+    k_max = Int(max_contraction_k(optcode, sizes))
+    primes, gate, product = pick_fast_crt_primes(k_max; target_envelope_log2)
+    @assert length(primes) ≥ 2 "need at least 2 primes; got $primes"
+    @assert all(gcd(primes[i], primes[j]) == 1 for i in eachindex(primes) for j in eachindex(primes) if i < j)
 
     @printf "=== Demo D: %d×%d grid CRT count reconstruction ===\n" L L
     @printf "  TreeSA optimize:        %8.3f s   tc=%g sc=%g\n" t_opt cc.tc cc.sc
-    @printf "  fast-path CRT primes:   P1=%d (%.1f bits)  P2=%d (%.1f bits)  P1·P2=%s (%.1f bits)\n" _P1 log2(_P1) _P2 log2(_P2) string(Int128(_P1)*Int128(_P2)) log2(Float64(Int128(_P1)*Int128(_P2)))
+    @printf "  max contraction K:      %d (2^%.2f)  → fast-path gate = :%s\n" k_max log2(k_max) gate
+    @printf "  CRT primes (%d):         %s  ⇒ product = %s (%.1f bits)\n" length(primes) join(string.(primes), ", ") string(product) log2(Float64(product))
 
-    score1, count1, t1 = _contract_with_P(ModCountingTropical{Float32, _P1}, optcode, Js)
-    score2, count2, t2 = _contract_with_P(ModCountingTropical{Float32, _P2}, optcode, Js)
-    @assert score1 == score2
-
-    exact = crt2(count1, _P1, count2, _P2)
-    @printf "  pass 1 (P=%d): %8.3f s   count mod P1 = %d\n" _P1 t1 count1
-    @printf "  pass 2 (P=%d): %8.3f s   count mod P2 = %d\n" _P2 t2 count2
+    # Run contractions for each prime; combine via incremental CRT.
+    scores  = Float32[]
+    counts  = Int[]
+    times   = Float64[]
+    for p in primes
+        s, c, t = _contract_with_P(ModCountingTropical{Float32, p}, optcode, Js)
+        push!(scores, s); push!(counts, c); push!(times, t)
+        @printf "  pass P=%-12d %8.3f s   count mod P = %d\n" p t c
+    end
+    @assert all(scores .== scores[1])
+    score1 = scores[1]
+    # Incremental CRT: combine residue_i with running (acc_value, acc_modulus).
+    exact = Int128(counts[1]); modulus = Int128(primes[1])
+    for i in 2:length(primes)
+        exact = crt2(exact, modulus, counts[i], primes[i])
+        modulus *= Int128(primes[i])
+    end
+    t_total = sum(times)
     @printf "  CRT-reconstructed exact count = %s\n" string(exact)
-    @printf "  ground-state score = %s\n" string(score1)
+    @printf "  ground-state score = %s   (kernel total: %.3f s)\n" string(score1) t_total
 
     # Cross-check against GTN — run its GPU path so it's an apples-to-apples
     # GPU-vs-GPU comparison. (CPU path also available via `usecuda=false`.)
@@ -364,14 +428,14 @@ function demo_grid_crt(L::Int; seed::Int = 42, ntrials::Int = 5, niters::Int = 2
         CUDA.synchronize()
     end
     @printf "  GTN-GPU reference: %8.3f s   exact count = %d\n" t_gtn gtn_count
-    @printf "  speedup over GTN-GPU:           %.2f×  (ours = %.3f s for both passes)\n" (t_gtn / (t1 + t2)) (t1 + t2)
+    @printf "  speedup over GTN-GPU:           %.2f×  (ours = %.3f s for %d passes)\n" (t_gtn / t_total) t_total length(primes)
 
     if Int128(score1) == Int128(gtn_score) && exact == Int128(gtn_count)
         println("  ✓ CRT reconstruction matches GTN-GPU exactly.\n")
     else
         @warn "disagreement" score1 gtn_score exact gtn_count
     end
-    return (; t_opt, t1, t2, t_gtn, exact, gtn_count)
+    return (; t_opt, times, t_total, t_gtn, exact, gtn_count, primes, gate)
 end
 
 function main()
@@ -390,4 +454,6 @@ function main()
     println("All checks passed.")
 end
 
-isinteractive() || main()
+if abspath(PROGRAM_FILE) == @__FILE__
+    main()
+end

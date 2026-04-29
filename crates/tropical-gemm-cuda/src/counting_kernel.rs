@@ -141,11 +141,15 @@ where
 
     // Spec N: dtype-specific tile dims. Block = (BN/TN, BM/TM); grid covers M, N.
     let block: (u32, u32, u32) = ((T::BN / T::TN) as u32, (T::BM / T::TM) as u32, 1);
-    let grid: (u32, u32, u32) = (
-        ((n + T::BN - 1) / T::BN) as u32,
-        ((m + T::BM - 1) / T::BM) as u32,
-        1,
-    );
+    // grid.x ↔ M-axis (limit 2^31), grid.y × grid.z ↔ N-axis (each cap
+    // 65535). Linearizing N across (y,z) handles lopsided OMEinsum
+    // reshapes where N-blocks alone exceed 65535. Kernel early-returns
+    // for over-launched blocks.
+    let m_blocks = ((m + T::BM - 1) / T::BM) as u32;
+    let n_blocks = ((n + T::BN - 1) / T::BN) as u32;
+    let grid_y = n_blocks.min(65535);
+    let grid_z = (n_blocks + grid_y - 1) / grid_y;
+    let grid: (u32, u32, u32) = (m_blocks, grid_y, grid_z);
     let cfg = cudarc::driver::LaunchConfig {
         grid_dim: grid,
         block_dim: block,

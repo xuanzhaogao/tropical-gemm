@@ -132,8 +132,14 @@ struct __align__(16) PairF64 { double val; int cnt; int _pad; };
     int tx = threadIdx.x, ty = threadIdx.y;                                    \
     int tid = ty * blockDim.x + tx;                                            \
     int threads_per_block = blockDim.x * blockDim.y;                           \
-    int block_i0 = blockIdx.y * (BM_);                                         \
-    int block_j0 = blockIdx.x * (BN_);                                         \
+    /* grid.x ↔ M-axis (cap 2^31), grid.y × grid.z ↔ N-axis (each cap 65535).  \
+       Linearize the (y, z) pair so lopsided shapes (rank-25 reshape with     \
+       N-blocks > 65535) don't trip the per-axis grid limit. Over-launched    \
+       blocks (when n_blocks isn't a multiple of gridDim.y) early-return. */  \
+    int block_i0 = blockIdx.x * (BM_);                                         \
+    int n_blk = blockIdx.y + blockIdx.z * (int)gridDim.y;                      \
+    int block_j0 = n_blk * (BN_);                                              \
+    if (block_j0 >= N) return;                                                 \
                                                                                \
     T                  acc_v[TM_][TN_];                                        \
     unsigned long long acc_c[TM_][TN_];                                        \
@@ -279,8 +285,14 @@ struct __align__(16) PairF64 { double val; int cnt; int _pad; };
     int tx = threadIdx.x, ty = threadIdx.y;                                    \
     int tid = ty * blockDim.x + tx;                                            \
     int threads_per_block = blockDim.x * blockDim.y;                           \
-    int block_i0 = blockIdx.y * (BM_);                                         \
-    int block_j0 = blockIdx.x * (BN_);                                         \
+    /* grid.x ↔ M-axis (cap 2^31), grid.y × grid.z ↔ N-axis (each cap 65535).  \
+       Linearize the (y, z) pair so lopsided shapes (rank-25 reshape with     \
+       N-blocks > 65535) don't trip the per-axis grid limit. Over-launched    \
+       blocks (when n_blocks isn't a multiple of gridDim.y) early-return. */  \
+    int block_i0 = blockIdx.x * (BM_);                                         \
+    int n_blk = blockIdx.y + blockIdx.z * (int)gridDim.y;                      \
+    int block_j0 = n_blk * (BN_);                                              \
+    if (block_j0 >= N) return;                                                 \
                                                                                \
     T     acc_v[TM_][TN_];                                                     \
     ACC_T acc_c[TM_][TN_];                                                     \
