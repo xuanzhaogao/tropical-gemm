@@ -11,14 +11,33 @@ use crate::context::CudaContext;
 use crate::error::Result;
 
 /// True iff the device backing `ctx` has compute capability ≥ 8.0
-/// (Ampere+). The cp.async pipelined `_pl` kernels target sm_80+; on
-/// older devices we route to the sync kernels.
-fn prefer_pipelined(ctx: &CudaContext) -> bool {
+/// (Ampere+). The pipelined `_pl` kernels target sm_80+; on older
+/// devices we route to the sync kernels.
+fn device_is_sm80_plus(ctx: &CudaContext) -> bool {
     use cudarc::driver::sys::CUdevice_attribute::*;
     ctx.device()
         .attribute(CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)
         .map(|major| major >= 8)
         .unwrap_or(false)
+}
+
+/// Spec Q safety: the `_pl` pipelined kernel uses a defer-mod inner loop
+/// (Barrett applied only at write-out). This is correct iff the u64 cnt
+/// accumulator never overflows during the K-reduction. Worst case per
+/// step is `(P-1)^2`; over `K` steps the bound is `K * (P-1)^2`.
+fn defer_mod_safe(p: i32, k: usize) -> bool {
+    if p <= 1 {
+        return true;
+    }
+    let pm1 = (p as i64 - 1) as u128;
+    let bound = pm1.saturating_mul(pm1).saturating_mul(k as u128);
+    bound < (1u128 << 63)
+}
+
+/// Pick the pipelined fast path only when both the device supports it
+/// and the (P, K) shape stays inside the defer-mod overflow envelope.
+fn prefer_pipelined(ctx: &CudaContext, p: i32, k: usize) -> bool {
+    device_is_sm80_plus(ctx) && defer_mod_safe(p, k)
 }
 
 /// Wraps a raw `CUdeviceptr` so it can be passed to `kernel.launch(...)` as a
@@ -90,7 +109,7 @@ where
             "tA/tB must be in {{'N','T'}}, got tA={}, tB={}", tA, tB
         ))),
     };
-    let suffix_with_variant = if prefer_pipelined(ctx) {
+    let suffix_with_variant = if prefer_pipelined(ctx, p, k) {
         format!("{}_pl", suffix)
     } else {
         suffix.to_string()
@@ -164,4 +183,30 @@ impl TropicalMatmulKernelName<f64, tropical_gemm::types::Max> for (f64, tropical
 }
 impl TropicalMatmulKernelName<f64, tropical_gemm::types::Min> for (f64, tropical_gemm::types::Min) {
     const BASE_NAME: &'static str = "tropical_matmul_f64_min";
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::defer_mod_safe;
+
+    #[test]
+    fn small_p_always_safe() {
+        assert!(defer_mod_safe(7, 4096));
+        assert!(defer_mod_safe(7, 1 << 30));
+        assert!(defer_mod_safe(65535, 1 << 30));
+    }
+
+    #[test]
+    fn large_p_blocks_long_k() {
+        // P near 2^31: (P-1)^2 ≈ 2^62, so any K > 2 trips the gate.
+        let p = i32::MAX;
+        assert!(!defer_mod_safe(p, 16));
+        assert!(!defer_mod_safe(p, 4096));
+    }
+
+    #[test]
+    fn p_at_or_below_one_is_safe() {
+        assert!(defer_mod_safe(0, 1 << 30));
+        assert!(defer_mod_safe(1, 1 << 30));
+    }
 }

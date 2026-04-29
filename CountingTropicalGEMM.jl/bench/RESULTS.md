@@ -197,6 +197,69 @@ PTX, which the implementation experience suggests has subtle interactions
 with the multi-buffer shared-memory layout we couldn't diagnose at the
 PTX level.
 
+## A100-SXM4-80GB (Spec Q defer-mod) — 2026-04-29
+
+Same pipeline structure as Spec P (BM=BN=64, BK=16, TM=TN=4 for f32, double-
+buffered shared), but the per-FMA Barrett reduction is removed from the
+inner K-loop. The cnt accumulator stays in u64 and absorbs raw `ac*bc`
+products; a single Barrett runs at write-out. Mathematically equivalent
+because `(a+b) mod P == ((a mod P)+(b mod P)) mod P`. Launcher gates the
+fast path on `K * (P-1)^2 < 2^63`; unsafe (P, K) shapes fall through to
+the unmodified Spec N sync kernel.
+
+| Shape | flag | ms / call | G tropical-ops/s |
+|---:|:---:|---:|---:|
+| 128³ | NN | 0.094 | 44.7 |
+| 128³ | NT | 0.104 | 40.5 |
+| 128³ | TN | 0.104 | 40.2 |
+| 128³ | TT | 0.094 | 44.6 |
+| 256³ | NN | 0.176 | 190.7 |
+| 256³ | NT | 0.189 | 177.3 |
+| 256³ | TN | 0.196 | 171.5 |
+| 256³ | TT | 0.170 | 197.2 |
+| 512³ | NN | 0.331 | 812.2 |
+| 512³ | NT | 0.373 | 720.3 |
+| 512³ | TN | 0.377 | 711.8 |
+| 512³ | TT | 0.323 | 832.0 |
+| 1024³ | NN | 1.692 | 1269.5 |
+| 1024³ | NT | 1.786 | 1202.3 |
+| 1024³ | TN | 1.823 | 1178.2 |
+| 1024³ | TT | 1.689 | 1271.3 |
+| 2048³ | NN | 10.540 | 1629.9 |
+| 2048³ | NT | 10.478 | 1639.7 |
+| 2048³ | TN | 10.513 | 1634.2 |
+| 2048³ | TT | 10.056 | 1708.4 |
+| 4096³ | NN | 74.778 | 1837.9 |
+| 4096³ | NT | 77.024 | 1784.4 |
+| 4096³ | TN | 77.757 | 1767.5 |
+| 4096³ | TT | 74.490 | **1845.1** |
+
+### Spec Q observations
+
+- **2.4× over Spec P at peak** (771 → 1845 G/s @ 4096³ TT). Bottleneck on
+  Spec P was per-step Barrett (`__umul64hi` + sub + cmp + sub) inside the
+  TM·TN×BK inner loop, not memory or shared-bank conflicts. Pulling
+  Barrett out of the inner loop eliminates ~5 emulated-u64 instructions
+  per FMA on every K-step.
+- **Hits the historical "~2 TG/s" target** that Spec K saw on its older
+  A100 path. The Spec N/P regression (down to ~750 G/s) was masked
+  Barrett cost; once removed, the kernel's actual SOL on the AoS
+  pair-multiply pattern is recovered.
+- **Tile geometry is not the bottleneck.** A 128×128 / TM=TN=8 probe at
+  both BK=8 and BK=16 measured 650–663 G/s — *worse* than 64×64 / 4×4 at
+  BK=16. Larger register blocks collapse occupancy (acc_v + acc_c u64 →
+  ~200 regs/thread before scratch); the 4×4 block is the sweet spot.
+- **Smaller BK hurts.** At 64×64/4×4 BK=8, 4096³ TT = 1702 G/s; BK=16 =
+  1845. The compute side gains more from K-reuse than the loader-side
+  gains from extra concurrent blocks.
+- **NN/TN still ~4% behind TT** at 4096³ (1837 vs 1845). The Spec N
+  layout-aware loader closed the original 4× gap; the residual is
+  shared-bank conflict in B's access pattern under NN.
+- **75/75 lib tests pass** including the byte-equal `pl_matches_sync_*`
+  set — confirms the equivalence holds across all four (tA, tB) layouts.
+- **Defer-mod safety gate** unit-tested (`gate_tests::*`): K * (P-1)² <
+  2^63 picks `_pl`, otherwise falls back to the always-correct sync.
+
 ## H100
 
 Pending — no H100 available at the time of writing. Re-run on A100-80GB
