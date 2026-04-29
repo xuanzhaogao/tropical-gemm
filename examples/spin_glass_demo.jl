@@ -237,6 +237,84 @@ function bench_grid(L::Int; seed::Int = 42, ntrials_treesa::Int = 1, niters_tree
     return (; t_opt, t_kernel, t_gtn, score, count, gtn_score, gtn_count)
 end
 
+# ---------------------------------------------------------------------------
+# Demo D: CRT reconstruction. Run the GPU pipeline twice with two coprime
+# primes P1, P2 to obtain count mod P1 and count mod P2, then combine via
+# 2-prime CRT to recover the exact count modulo P1*P2. As long as
+# true_count < P1*P2 (~ 4.6e18 here), this is the integer count.
+# ---------------------------------------------------------------------------
+const _P1 = 2147483647   # M31 = 2^31 − 1, prime
+const _P2 = 2147483629   # 2^31 − 19, prime
+@assert gcd(_P1, _P2) == 1
+
+function _edge_tensor_for(::Type{E}, J::Float32) where E
+    M = Matrix{E}(undef, 2, 2)
+    for a in 1:2, b in 1:2
+        M[a, b] = E(-J * spin(a) * spin(b), Int32(1))
+    end
+    return CuArray(M)
+end
+
+function _contract_with_P(::Type{E}, optcode, Js::Vector{Float32}) where E
+    Es = [_edge_tensor_for(E, J) for J in Js]
+    optcode(Es...); CUDA.synchronize()                # warmup
+    t = @elapsed begin
+        res = optcode(Es...)
+        CUDA.synchronize()
+    end
+    res_host = Array(res::CuArray{E, 0})[]
+    return res_host.n, Int(res_host.c), t
+end
+
+# 2-prime CRT: returns x ∈ [0, P1*P2) with x ≡ r1 (mod P1), x ≡ r2 (mod P2).
+function crt2(r1::Integer, P1::Integer, r2::Integer, P2::Integer)
+    inv_P1_mod_P2 = invmod(P1, P2)
+    k = mod((Int128(r2) - Int128(r1)) * Int128(inv_P1_mod_P2), Int128(P2))
+    return Int128(r1) + Int128(P1) * k
+end
+
+function demo_grid_crt(L::Int; seed::Int = 42, ntrials::Int = 5, niters::Int = 20)
+    Random.seed!(seed)
+    N = L * L
+    edge_list = build_grid_edges(L)
+    Js = Float32.(rand([-1, 1], length(edge_list)))
+    edges_with_J = [(e, J) for (e, J) in zip(edge_list, Js)]
+
+    labels = [Symbol("v", i) for i in 1:N]
+    edge_label_pairs = [[labels[i], labels[j]] for (i, j) in edge_list]
+    code = OMEinsum.EinCode(edge_label_pairs, Symbol[])
+    t_opt = @elapsed optcode = optimize_code(code, uniformsize(code, 2),
+        TreeSA(; ntrials, niters))
+    cc = contraction_complexity(optcode, uniformsize(code, 2))
+
+    @printf "=== Demo D: %d×%d grid CRT count reconstruction ===\n" L L
+    @printf "  TreeSA optimize:        %8.3f s   tc=%g sc=%g\n" t_opt cc.tc cc.sc
+
+    score1, count1, t1 = _contract_with_P(ModCountingTropical{Float32, _P1}, optcode, Js)
+    score2, count2, t2 = _contract_with_P(ModCountingTropical{Float32, _P2}, optcode, Js)
+    @assert score1 == score2
+
+    exact = crt2(count1, _P1, count2, _P2)
+    @printf "  pass 1 (P=%d): %8.3f s   count mod P1 = %d\n" _P1 t1 count1
+    @printf "  pass 2 (P=%d): %8.3f s   count mod P2 = %d\n" _P2 t2 count2
+    @printf "  CRT-reconstructed exact count = %s\n" string(exact)
+    @printf "  ground-state score = %s\n" string(score1)
+
+    # Cross-check against GTN.
+    g = SimpleGraph(N)
+    for (i, j) in edge_list; add_edge!(g, i, j); end
+    Js_by_edge = Dict((min(i,j), max(i,j)) => J for ((i, j), J) in edges_with_J)
+    t_gtn = @elapsed gtn_score, gtn_count = gtn_solve(g, Js_by_edge, N)
+    @printf "  GTN reference: %8.3f s   exact count = %d\n" t_gtn gtn_count
+
+    if Int128(score1) == Int128(gtn_score) && exact == Int128(gtn_count)
+        println("  ✓ CRT reconstruction matches GTN exactly.\n")
+    else
+        @warn "disagreement" score1 gtn_score exact gtn_count
+    end
+    return (; t_opt, t1, t2, t_gtn, exact, gtn_count)
+end
+
 function main()
     @printf "GPU: %s\n\n" CUDA.name(CUDA.device())
     demo_chain()
@@ -248,6 +326,8 @@ function main()
     bench_grid(12)
     bench_grid(14)
     bench_grid(20; ntrials_treesa = 5, niters_treesa = 20, sc_skip = 26)
+    println("--- CRT demo ---\n")
+    demo_grid_crt(20)
     println("All checks passed.")
 end
 
