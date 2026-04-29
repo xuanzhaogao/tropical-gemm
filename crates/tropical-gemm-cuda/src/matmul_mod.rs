@@ -71,13 +71,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn nvrtc_compiles_pipelined_kernel() {
-        let ctx = crate::get_global_context().expect("CUDA ctx");
-        let _k = ctx.get_kernel("tropical_matmul_f32_max_NN_pl")
-            .expect("pipelined kernel must compile under NVRTC");
-    }
-
-    #[test]
     fn tropical_matmul_nn_2x2_max_p7() {
         // Column-major A (2×2): A[0,0]=1, A[1,0]=3, A[0,1]=2, A[1,1]=4.
         // Bytes flat (col-major): [1, 3, 2, 4].
@@ -303,4 +296,98 @@ mod tests {
 
     #[test] fn ragged_k_2bk_minus_1_nn_f32() { run_and_check_f32_max('N','N', 8, 15, 8, 7); }
     #[test] fn ragged_k_1_tt_f32() { run_and_check_f32_max('T','T', 8, 1, 8, 7); }
+
+    // ---- Spec P: byte-equal sync-vs-pipelined correctness tests ----
+
+    fn launch_named_kernel_f32(
+        kernel_name: &'static str,
+        m: usize, k: usize, n: usize,
+        a_dev: u64, b_dev: u64, p: i32, out_dev: u64,
+    ) -> std::result::Result<(), String> {
+        use cudarc::driver::LaunchAsync;
+        use crate::counting_kernel::DevPtr;
+        let ctx = crate::get_global_context().map_err(|e| format!("{e}"))?;
+        let kernel = ctx.get_kernel(kernel_name).map_err(|e| format!("{e}"))?;
+        // Same grid/block math the launcher uses for f32 (BM=BN=64, TM=TN=4)
+        // — output tile shape and addressing are independent of (tA, tB).
+        let block: (u32, u32, u32) = (16, 16, 1);
+        let grid: (u32, u32, u32) = (
+            ((n + 63) / 64) as u32,
+            ((m + 63) / 64) as u32,
+            1,
+        );
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: grid, block_dim: block, shared_mem_bytes: 0,
+        };
+        let mu: u64 = if p > 1 { ((1u128 << 64) / p as u128) as u64 } else { 0 };
+        ctx.device().synchronize().map_err(|e| format!("{e}"))?;
+        unsafe {
+            kernel.launch(cfg, (
+                DevPtr(a_dev), DevPtr(b_dev), DevPtr(out_dev),
+                m as i32, n as i32, k as i32, p, mu,
+            )).map_err(|e| format!("{e}"))?;
+        }
+        ctx.device().synchronize().map_err(|e| format!("{e}"))?;
+        Ok(())
+    }
+
+    fn cuda_arch_at_least_80() -> bool {
+        use cudarc::driver::sys::CUdevice_attribute::*;
+        crate::get_global_context().ok().and_then(|ctx| {
+            ctx.device().attribute(CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR).ok()
+        }).map(|m| m >= 8).unwrap_or(false)
+    }
+
+    fn compare_sync_vs_pl_f32_max(layout_sfx: &'static str,
+                                   sync_name: &'static str,
+                                   pl_name:   &'static str,
+                                   m: usize, k: usize, n: usize, p: i32) {
+        if !cuda_arch_at_least_80() {
+            eprintln!("compare_sync_vs_pl[{layout_sfx}]: skipped on sm_<80");
+            return;
+        }
+        use cudarc::driver::DevicePtr;
+        let ctx = crate::get_global_context().expect("CUDA ctx");
+        let a_host = rand_pairs_f32(m * k, p);
+        let b_host = rand_pairs_f32(k * n, p);
+        let a_dev = ctx.device().htod_copy(a_host).unwrap();
+        let b_dev = ctx.device().htod_copy(b_host).unwrap();
+        let out_sync = ctx.device().alloc_zeros::<crate::pair::PairF32>(m * n).unwrap();
+        let out_pl   = ctx.device().alloc_zeros::<crate::pair::PairF32>(m * n).unwrap();
+
+        launch_named_kernel_f32(
+            sync_name, m, k, n,
+            *a_dev.device_ptr(), *b_dev.device_ptr(), p, *out_sync.device_ptr(),
+        ).expect("sync kernel launch");
+        launch_named_kernel_f32(
+            pl_name, m, k, n,
+            *a_dev.device_ptr(), *b_dev.device_ptr(), p, *out_pl.device_ptr(),
+        ).expect("pipelined kernel launch");
+
+        let s = ctx.device().dtoh_sync_copy(&out_sync).unwrap();
+        let p_out = ctx.device().dtoh_sync_copy(&out_pl).unwrap();
+        for idx in 0..(m * n) {
+            assert_eq!(s[idx].val, p_out[idx].val,
+                "[{layout_sfx}] val mismatch at {idx} (m={m}, k={k}, n={n})");
+            assert_eq!(s[idx].cnt, p_out[idx].cnt,
+                "[{layout_sfx}] cnt mismatch at {idx} (m={m}, k={k}, n={n})");
+        }
+    }
+
+    fn check_all_layouts(m: usize, k: usize, n: usize, p: i32) {
+        for (sfx, sync_n, pl_n) in [
+            ("NN", "tropical_matmul_f32_max_NN", "tropical_matmul_f32_max_NN_pl"),
+            ("NT", "tropical_matmul_f32_max_NT", "tropical_matmul_f32_max_NT_pl"),
+            ("TN", "tropical_matmul_f32_max_TN", "tropical_matmul_f32_max_TN_pl"),
+            ("TT", "tropical_matmul_f32_max_TT", "tropical_matmul_f32_max_TT_pl"),
+        ] {
+            compare_sync_vs_pl_f32_max(sfx, sync_n, pl_n, m, k, n, p);
+        }
+    }
+
+    #[test] fn pl_matches_sync_64_64_64()  { check_all_layouts(64, 64, 64, 7); }
+    #[test] fn pl_matches_sync_64_160_64() { check_all_layouts(64, 160, 64, 7); }
+    #[test] fn pl_matches_sync_64_33_64()  { check_all_layouts(64, 33, 64, 7); }
+    #[test] fn pl_matches_sync_65_65_65()  { check_all_layouts(65, 65, 65, 7); }
+    #[test] fn pl_matches_sync_100_33_77() { check_all_layouts(100, 33, 77, 11); }
 }
