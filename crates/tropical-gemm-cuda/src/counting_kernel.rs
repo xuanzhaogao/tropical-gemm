@@ -10,6 +10,17 @@ use cudarc::driver::DeviceRepr;
 use crate::context::CudaContext;
 use crate::error::Result;
 
+/// True iff the device backing `ctx` has compute capability ≥ 8.0
+/// (Ampere+). The cp.async pipelined `_pl` kernels target sm_80+; on
+/// older devices we route to the sync kernels.
+fn prefer_pipelined(ctx: &CudaContext) -> bool {
+    use cudarc::driver::sys::CUdevice_attribute::*;
+    ctx.device()
+        .attribute(CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)
+        .map(|major| major >= 8)
+        .unwrap_or(false)
+}
+
 /// Wraps a raw `CUdeviceptr` so it can be passed to `kernel.launch(...)` as a
 /// kernel parameter. Used by the kernel-only entry points whose callers
 /// (e.g. CUDA.jl on the Julia side) own the device buffers themselves —
@@ -79,10 +90,15 @@ where
             "tA/tB must be in {{'N','T'}}, got tA={}, tB={}", tA, tB
         ))),
     };
+    let suffix_with_variant = if prefer_pipelined(ctx) {
+        format!("{}_pl", suffix)
+    } else {
+        suffix.to_string()
+    };
     let kernel_name_owned: String = format!(
         "{}_{}",
         <(T, D) as TropicalMatmulKernelName<T, D>>::BASE_NAME,
-        suffix
+        suffix_with_variant
     );
     // cudarc requires &'static str for kernel lookup. We leak the formatted
     // name once per (T, D, tA, tB) at runtime — 16 leaks total, bounded.
