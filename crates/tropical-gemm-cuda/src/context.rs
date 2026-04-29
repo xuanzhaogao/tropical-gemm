@@ -83,6 +83,23 @@ const COUNTING_KERNEL_NAMES: &[&str] = &[
     "tropical_matmul_f64_min_NT",
     "tropical_matmul_f64_min_TN",
     "tropical_matmul_f64_min_TT",
+    // Spec P: cp.async pipelined variants (sm_80+).
+    "tropical_matmul_f32_max_NN_pl",
+    "tropical_matmul_f32_max_NT_pl",
+    "tropical_matmul_f32_max_TN_pl",
+    "tropical_matmul_f32_max_TT_pl",
+    "tropical_matmul_f32_min_NN_pl",
+    "tropical_matmul_f32_min_NT_pl",
+    "tropical_matmul_f32_min_TN_pl",
+    "tropical_matmul_f32_min_TT_pl",
+    "tropical_matmul_f64_max_NN_pl",
+    "tropical_matmul_f64_max_NT_pl",
+    "tropical_matmul_f64_max_TN_pl",
+    "tropical_matmul_f64_max_TT_pl",
+    "tropical_matmul_f64_min_NN_pl",
+    "tropical_matmul_f64_min_NT_pl",
+    "tropical_matmul_f64_min_TN_pl",
+    "tropical_matmul_f64_min_TT_pl",
 ];
 
 /// CUDA context for tropical GEMM operations.

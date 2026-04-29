@@ -426,3 +426,40 @@ DEFINE_TILED_F64(tropical_matmul_f64_min_NN, POS_INF_F64, MIN_BETTER, A_OFF_N, B
 DEFINE_TILED_F64(tropical_matmul_f64_min_NT, POS_INF_F64, MIN_BETTER, A_OFF_N, B_OFF_T, LOAD_A_DECOMP_N, LOAD_B_DECOMP_T)
 DEFINE_TILED_F64(tropical_matmul_f64_min_TN, POS_INF_F64, MIN_BETTER, A_OFF_T, B_OFF_N, LOAD_A_DECOMP_T, LOAD_B_DECOMP_N)
 DEFINE_TILED_F64(tropical_matmul_f64_min_TT, POS_INF_F64, MIN_BETTER, A_OFF_T, B_OFF_T, LOAD_A_DECOMP_T, LOAD_B_DECOMP_T)
+
+#define DEFINE_TILED_F32_PIPELINED(NAME, INIT_VAL, BETTER, A_OFF, B_OFF, LOAD_A, LOAD_B) \
+extern "C" __global__ void NAME(                                               \
+    const PairF32* __restrict__ pair_a,                                        \
+    const PairF32* __restrict__ pair_b,                                        \
+    PairF32* __restrict__ out_c,                                               \
+    int M, int N, int K, int P, unsigned long long MU                          \
+)                                                                              \
+TROPICAL_MATMUL_TILED_PIPELINED_BODY(float, PairF32, INIT_VAL, BETTER, A_OFF, B_OFF, \
+                                     LOAD_A, LOAD_B, 64, 64, 16, 4, 4)
+
+#define DEFINE_TILED_F64_PIPELINED(NAME, INIT_VAL, BETTER, A_OFF, B_OFF, LOAD_A, LOAD_B) \
+extern "C" __global__ void NAME(                                               \
+    const PairF64* __restrict__ pair_a,                                        \
+    const PairF64* __restrict__ pair_b,                                        \
+    PairF64* __restrict__ out_c,                                               \
+    int M, int N, int K, int P, unsigned long long MU                          \
+)                                                                              \
+TROPICAL_MATMUL_TILED_PIPELINED_BODY(double, PairF64, INIT_VAL, BETTER, A_OFF, B_OFF, \
+                                     LOAD_A, LOAD_B, 32, 32, 8, 2, 4)
+
+DEFINE_TILED_F32_PIPELINED(tropical_matmul_f32_max_NN_pl, NEG_INF_F32, MAX_BETTER, A_OFF_N, B_OFF_N, LOAD_A_DECOMP_N, LOAD_B_DECOMP_N)
+DEFINE_TILED_F32_PIPELINED(tropical_matmul_f32_max_NT_pl, NEG_INF_F32, MAX_BETTER, A_OFF_N, B_OFF_T, LOAD_A_DECOMP_N, LOAD_B_DECOMP_T)
+DEFINE_TILED_F32_PIPELINED(tropical_matmul_f32_max_TN_pl, NEG_INF_F32, MAX_BETTER, A_OFF_T, B_OFF_N, LOAD_A_DECOMP_T, LOAD_B_DECOMP_N)
+DEFINE_TILED_F32_PIPELINED(tropical_matmul_f32_max_TT_pl, NEG_INF_F32, MAX_BETTER, A_OFF_T, B_OFF_T, LOAD_A_DECOMP_T, LOAD_B_DECOMP_T)
+DEFINE_TILED_F32_PIPELINED(tropical_matmul_f32_min_NN_pl, POS_INF_F32, MIN_BETTER, A_OFF_N, B_OFF_N, LOAD_A_DECOMP_N, LOAD_B_DECOMP_N)
+DEFINE_TILED_F32_PIPELINED(tropical_matmul_f32_min_NT_pl, POS_INF_F32, MIN_BETTER, A_OFF_N, B_OFF_T, LOAD_A_DECOMP_N, LOAD_B_DECOMP_T)
+DEFINE_TILED_F32_PIPELINED(tropical_matmul_f32_min_TN_pl, POS_INF_F32, MIN_BETTER, A_OFF_T, B_OFF_N, LOAD_A_DECOMP_T, LOAD_B_DECOMP_N)
+DEFINE_TILED_F32_PIPELINED(tropical_matmul_f32_min_TT_pl, POS_INF_F32, MIN_BETTER, A_OFF_T, B_OFF_T, LOAD_A_DECOMP_T, LOAD_B_DECOMP_T)
+DEFINE_TILED_F64_PIPELINED(tropical_matmul_f64_max_NN_pl, NEG_INF_F64, MAX_BETTER, A_OFF_N, B_OFF_N, LOAD_A_DECOMP_N, LOAD_B_DECOMP_N)
+DEFINE_TILED_F64_PIPELINED(tropical_matmul_f64_max_NT_pl, NEG_INF_F64, MAX_BETTER, A_OFF_N, B_OFF_T, LOAD_A_DECOMP_N, LOAD_B_DECOMP_T)
+DEFINE_TILED_F64_PIPELINED(tropical_matmul_f64_max_TN_pl, NEG_INF_F64, MAX_BETTER, A_OFF_T, B_OFF_N, LOAD_A_DECOMP_T, LOAD_B_DECOMP_N)
+DEFINE_TILED_F64_PIPELINED(tropical_matmul_f64_max_TT_pl, NEG_INF_F64, MAX_BETTER, A_OFF_T, B_OFF_T, LOAD_A_DECOMP_T, LOAD_B_DECOMP_T)
+DEFINE_TILED_F64_PIPELINED(tropical_matmul_f64_min_NN_pl, POS_INF_F64, MIN_BETTER, A_OFF_N, B_OFF_N, LOAD_A_DECOMP_N, LOAD_B_DECOMP_N)
+DEFINE_TILED_F64_PIPELINED(tropical_matmul_f64_min_NT_pl, POS_INF_F64, MIN_BETTER, A_OFF_N, B_OFF_T, LOAD_A_DECOMP_N, LOAD_B_DECOMP_T)
+DEFINE_TILED_F64_PIPELINED(tropical_matmul_f64_min_TN_pl, POS_INF_F64, MIN_BETTER, A_OFF_T, B_OFF_N, LOAD_A_DECOMP_T, LOAD_B_DECOMP_N)
+DEFINE_TILED_F64_PIPELINED(tropical_matmul_f64_min_TT_pl, POS_INF_F64, MIN_BETTER, A_OFF_T, B_OFF_T, LOAD_A_DECOMP_T, LOAD_B_DECOMP_T)

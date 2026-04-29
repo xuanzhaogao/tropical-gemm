@@ -71,6 +71,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn nvrtc_compiles_pipelined_kernel() {
+        let ctx = crate::get_global_context().expect("CUDA ctx");
+        let _k = ctx.get_kernel("tropical_matmul_f32_max_NN_pl")
+            .expect("pipelined kernel must compile under NVRTC");
+    }
+
+    #[test]
     fn tropical_matmul_nn_2x2_max_p7() {
         // Column-major A (2×2): A[0,0]=1, A[1,0]=3, A[0,1]=2, A[1,1]=4.
         // Bytes flat (col-major): [1, 3, 2, 4].
