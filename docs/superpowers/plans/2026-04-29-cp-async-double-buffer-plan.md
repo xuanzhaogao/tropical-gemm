@@ -17,7 +17,7 @@
 - **Modify** `crates/tropical-gemm-cuda/kernels/counting_gemm.cu` — add `TROPICAL_MATMUL_TILED_PIPELINED_BODY` macro (cp.async + 2-buffer ping-pong), add 16 `*_pipelined_*` kernels (NN/NT/TN/TT × f32/f64 × max/min). Existing 16 sync kernels stay intact.
 - **Modify** `crates/tropical-gemm-cuda/src/counting_kernel.rs` — add a `prefer_pipelined` flag computed once from the device's compute capability; route to `*_pipelined_*` kernel names when set. The 4-character suffix dispatch (NN/NT/TN/TT) and tile-dim math stay the same.
 - **Modify** `crates/tropical-gemm-cuda/src/context.rs` — register the 16 new kernel names alongside the existing 16.
-- **Modify** `crates/tropical-gemm-cuda/src/matmul_mod.rs` — no signature change; one extra inline test confirms the pipelined path produces the same output as the sync path on a known small case.
+- **Modify** `crates/tropical-gemm-cuda/src/matmul_mod.rs` — no signature change; add a named-kernel launch helper plus five byte-equal sync-vs-pipelined tests (covers all four `(tA, tB)` layouts and the ragged-K / ragged-M-N edge cases). Tests skip cleanly on sm_<80.
 - **Modify** `CountingTropicalGEMM.jl/bench/RESULTS.md` — append a new "## A100-SXM4-80GB (Spec P pipelined)" section with the bench numbers.
 
 The compute body, write-out, and `LOAD_*_DECOMP_*` macros are reused unchanged. Only the load phase is rewritten.
@@ -566,12 +566,12 @@ dispatcher: launch `tropical_matmul_f32_max_NN` (sync) and
 require byte-equal output. On sm_<80 this test is skipped (the `_pl`
 kernel is sm_80-specific PTX).
 
-- [ ] **Step 1: Add a low-level launch helper that takes an explicit kernel name**
+- [ ] **Step 1: Add a layout-agnostic named-kernel launch helper**
 
 In the `mod tests` block of `matmul_mod.rs`, add:
 
 ```rust
-fn launch_named_kernel_f32_max_NN(
+fn launch_named_kernel_f32(
     kernel_name: &'static str,
     m: usize, k: usize, n: usize,
     a_dev: u64, b_dev: u64, p: i32, out_dev: u64,
@@ -580,7 +580,8 @@ fn launch_named_kernel_f32_max_NN(
     use crate::counting_kernel::DevPtr;
     let ctx = crate::get_global_context().map_err(|e| format!("{e}"))?;
     let kernel = ctx.get_kernel(kernel_name).map_err(|e| format!("{e}"))?;
-    // Same grid/block math the launcher would use for f32 BM=BN=64, TM=TN=4.
+    // Same grid/block math the launcher uses for f32 (BM=BN=64, TM=TN=4)
+    // — output tile shape and addressing are independent of (tA, tB).
     let block: (u32, u32, u32) = (16, 16, 1);
     let grid: (u32, u32, u32) = (
         ((n + 63) / 64) as u32,
@@ -608,14 +609,24 @@ fn cuda_arch_at_least_80() -> bool {
         ctx.device().attribute(CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR).ok()
     }).map(|m| m >= 8).unwrap_or(false)
 }
-```
 
-- [ ] **Step 2: Add the byte-equal test fixtures**
-
-```rust
-fn compare_sync_vs_pl_f32_max(m: usize, k: usize, n: usize, p: i32) {
+/// Compare sync vs pipelined for a given f32_max layout and shape. The
+/// caller supplies the (tA, tB)-encoded layout suffix once; we run both
+/// `*_<sfx>` and `*_<sfx>_pl` on the SAME (a_dev, b_dev) inputs and
+/// require byte-equal outputs.
+///
+/// Note: a_dev / b_dev hold the same packed bytes regardless of layout
+/// (the kernel reinterprets them via the layout-aware A_OFF / B_OFF
+/// macros), so a single random buffer of `m * k` (resp `k * n`) Pairs
+/// works for every layout. M and N get swapped on the storage side
+/// in the kernel under the 'T' flag, but the *test* doesn't care
+/// because we're only checking sync == pipelined for that exact layout.
+fn compare_sync_vs_pl_f32_max(layout_sfx: &'static str,
+                               sync_name: &'static str,
+                               pl_name:   &'static str,
+                               m: usize, k: usize, n: usize, p: i32) {
     if !cuda_arch_at_least_80() {
-        eprintln!("compare_sync_vs_pl: skipped on sm_<80");
+        eprintln!("compare_sync_vs_pl[{layout_sfx}]: skipped on sm_<80");
         return;
     }
     use cudarc::driver::DevicePtr;
@@ -627,14 +638,12 @@ fn compare_sync_vs_pl_f32_max(m: usize, k: usize, n: usize, p: i32) {
     let out_sync = ctx.device().alloc_zeros::<crate::pair::PairF32>(m * n).unwrap();
     let out_pl   = ctx.device().alloc_zeros::<crate::pair::PairF32>(m * n).unwrap();
 
-    launch_named_kernel_f32_max_NN(
-        "tropical_matmul_f32_max_NN",
-        m, k, n,
+    launch_named_kernel_f32(
+        sync_name, m, k, n,
         *a_dev.device_ptr(), *b_dev.device_ptr(), p, *out_sync.device_ptr(),
     ).expect("sync kernel launch");
-    launch_named_kernel_f32_max_NN(
-        "tropical_matmul_f32_max_NN_pl",
-        m, k, n,
+    launch_named_kernel_f32(
+        pl_name, m, k, n,
         *a_dev.device_ptr(), *b_dev.device_ptr(), p, *out_pl.device_ptr(),
     ).expect("pipelined kernel launch");
 
@@ -642,22 +651,38 @@ fn compare_sync_vs_pl_f32_max(m: usize, k: usize, n: usize, p: i32) {
     let p_out = ctx.device().dtoh_sync_copy(&out_pl).unwrap();
     for idx in 0..(m * n) {
         assert_eq!(s[idx].val, p_out[idx].val,
-            "val mismatch at {idx} (m={m}, k={k}, n={n})");
+            "[{layout_sfx}] val mismatch at {idx} (m={m}, k={k}, n={n})");
         assert_eq!(s[idx].cnt, p_out[idx].cnt,
-            "cnt mismatch at {idx} (m={m}, k={k}, n={n})");
+            "[{layout_sfx}] cnt mismatch at {idx} (m={m}, k={k}, n={n})");
+    }
+}
+```
+
+- [ ] **Step 2: Add the byte-equal test fixtures across all 4 layouts**
+
+```rust
+// Helper that fans out (m, k, n, p) across NN / NT / TN / TT.
+fn check_all_layouts(m: usize, k: usize, n: usize, p: i32) {
+    for (sfx, sync_n, pl_n) in [
+        ("NN", "tropical_matmul_f32_max_NN", "tropical_matmul_f32_max_NN_pl"),
+        ("NT", "tropical_matmul_f32_max_NT", "tropical_matmul_f32_max_NT_pl"),
+        ("TN", "tropical_matmul_f32_max_TN", "tropical_matmul_f32_max_TN_pl"),
+        ("TT", "tropical_matmul_f32_max_TT", "tropical_matmul_f32_max_TT_pl"),
+    ] {
+        compare_sync_vs_pl_f32_max(sfx, sync_n, pl_n, m, k, n, p);
     }
 }
 
 // Exact tile multiples — easiest case.
-#[test] fn pl_matches_sync_64_64_64()    { compare_sync_vs_pl_f32_max(64, 64, 64, 7); }
-// 5 K-tiles → 4 pipeline handoffs.
-#[test] fn pl_matches_sync_64_160_64()   { compare_sync_vs_pl_f32_max(64, 160, 64, 7); }
-// Ragged K (last tile has < BK elements).
-#[test] fn pl_matches_sync_64_33_64()    { compare_sync_vs_pl_f32_max(64, 33, 64, 7); }
+#[test] fn pl_matches_sync_64_64_64()  { check_all_layouts(64, 64, 64, 7); }
+// 10 K-tiles (BK_pl = 16) → 9 pipeline handoffs.
+#[test] fn pl_matches_sync_64_160_64() { check_all_layouts(64, 160, 64, 7); }
+// Ragged K (last tile has < BK_pl=16 elements).
+#[test] fn pl_matches_sync_64_33_64()  { check_all_layouts(64, 33, 64, 7); }
 // Ragged M and N (sentinel-write path).
-#[test] fn pl_matches_sync_65_65_65()    { compare_sync_vs_pl_f32_max(65, 65, 65, 7); }
+#[test] fn pl_matches_sync_65_65_65()  { check_all_layouts(65, 65, 65, 7); }
 // Ragged across all three.
-#[test] fn pl_matches_sync_100_33_77()   { compare_sync_vs_pl_f32_max(100, 33, 77, 11); }
+#[test] fn pl_matches_sync_100_33_77() { check_all_layouts(100, 33, 77, 11); }
 ```
 
 - [ ] **Step 3: Drop the temporary smoke test from Task 3 if it's still there**
@@ -673,15 +698,23 @@ Run:
 srun --jobid=6308637 --overlap bash -lc 'export PATH=$HOME/.cargo/bin:$PATH; module load cuda; cargo test --release -p tropical-gemm-cuda 2>&1 | tail -15'
 ```
 
-Expected: 70 sync tests (Spec N) + 5 new byte-equal tests = 75 passing.
-On sm_<80 the 5 new tests print "skipped" and pass trivially.
+Expected: 70 sync tests (Spec N) + 5 new byte-equal tests (each fans
+out across 4 layouts internally) = 75 passing test functions, 90 layout
+comparisons. On sm_<80 the 5 new tests print "skipped" per layout and
+pass trivially.
 
-If any byte-equal test fails, the bug is in Task 2 or 3. Useful triage:
-1. Print first-cell diff and the (M, K, N) of the failing case.
-2. Try `compare_sync_vs_pl_f32_max(2, 1, 2, 7)` — minimal case, 1 K-tile.
-3. If only the ragged-K case fails: bug is in the final-tile drain
-   (`last_kk_end < BK_`). If only ragged-M/N fails: bug is in the
-   sentinel-write race contained by `__syncthreads()`.
+If any byte-equal test fails, the assert message tells you which layout
+(NN / NT / TN / TT) and (M, K, N). Useful triage:
+1. **Single layout fails, others pass** → bug is in the LOAD_*_DECOMP_*
+   wiring for that layout in Task 3 (the macro chose the wrong
+   fastest-axis decomposition).
+2. **All 4 layouts fail at the ragged-K case** → bug is in the final-tile
+   drain (`last_kk_end < BK_`).
+3. **All 4 layouts fail at ragged-M/N** → bug is in the sentinel-write
+   race; the `__syncthreads()` after `CP_ASYNC_WAIT_GROUP` should make
+   both the cp.async writes and the direct sentinel stores visible.
+4. **All 4 layouts fail at exact-multiples** → bug is in the prefetch /
+   wait_group ordering (Task 2 macro structure).
 
 - [ ] **Step 5: Commit**
 
@@ -712,8 +745,17 @@ Add this block after the existing "## A100-SXM4-80GB (Spec N tiled) — 2026-04-
 ```markdown
 ## A100-SXM4-80GB (Spec P pipelined) — 2026-04-29
 
-cp.async double-buffered version of the Spec N kernel. Tile geometry
-unchanged from the A100-tuned baseline (BM=BN=64, BK=32, TM=TN=4 for f32).
+cp.async double-buffered version of the Spec N kernel. f32 tile is
+**BM=BN=64, BK=16, TM=TN=4** — BK is half the sync baseline (BK=32) to
+fit the doubled (2-stage) shared memory under the A100 48 KiB
+static-shared limit without requiring `cudaFuncSetAttribute` opt-in.
+f64 tile unchanged from sync at BM=BN=32, BK=8, TM=2, TN=4.
+
+Therefore the head-to-head comparison records pipelined@BK=16 vs
+sync@BK=32 — the throughput question being answered is "does cp.async
+pipelining at BK=16 beat synchronous loads at BK=32?". If the answer is
+no, the appendix's dynamic-shared opt-in path lets us try
+pipelined@BK=32 in a follow-on.
 
 | Shape | flag | ms / call | G tropical-ops/s |
 |---:|:---:|---:|---:|
@@ -721,11 +763,13 @@ unchanged from the A100-tuned baseline (BM=BN=64, BK=32, TM=TN=4 for f32).
 
 ### Observations
 
-- 4096³ TT: <X> G/s, vs 763 G/s sync baseline = <ratio>×.
-- All four flags within ~5% (cp.async carries the layout-aware coalescing
-  property from Spec N).
+- 4096³ TT pipelined@BK=16: <X> G/s, vs 763 G/s sync@BK=32 = <ratio>×.
+- All four flags within ~5% (cp.async preserves the layout-aware
+  coalescing from Spec N).
 - RTX 6000 falls back to the sync kernel via runtime dispatch — its
   numbers are unchanged from the existing Spec N table.
+- If the pipelined throughput < sync, the appendix outlines the dynamic
+  shared opt-in path (Spec P.1) to lift the BK cap and re-bench.
 ```
 
 Replace `<X>` and `<ratio>` with the measured values from /tmp/specp_bench.txt.
@@ -812,3 +856,15 @@ modest tile depth, not from extreme BK.
    pipelined f32 starts at BK=16 (32 KiB shared) instead of BK=32
    (~65 KiB, would need dynamic-shared opt-in). Appendix documents the
    escalation path.
+
+## Codex-review revisions round 2
+
+6. **Task 6 bench section had stale BK=32 geometry** — corrected to
+   BK=16 with explicit note that the head-to-head is pipelined@BK=16
+   vs sync@BK=32.
+7. **Task 5 only covered the NN layout** — refactored into a
+   `check_all_layouts(m,k,n,p)` fan-out so each of the 5 ragged/edge
+   shapes runs against NN, NT, TN, and TT (20 layout comparisons
+   total). Failure messages tag the layout for fast triage.
+8. **File map said "one extra inline test"** — updated to reflect the
+   helper + 5 multi-layout tests.
