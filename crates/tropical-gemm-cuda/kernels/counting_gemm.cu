@@ -223,6 +223,170 @@ struct __align__(16) PairF64 { double val; int cnt; int _pad; };
     }                                                                          \
 }
 
+// Spec P: cp.async pipelined variant. Two shared-memory buffers per
+// operand (As_v[2][...], etc.) ping-pong: while the compute phase reads
+// buffer cur, the loader prefetches the next K-tile into buffer 1-cur.
+//
+// Pipeline layout (NUM_STAGES = 2):
+//   prefetch tile 0 -> buffer 0 -> commit
+//   for kk = BK; kk < K; kk += BK:
+//       prefetch tile (kk/BK) -> buffer (kk/BK & 1) -> commit
+//       wait_group 1                       // ensure tile (kk/BK)-1 ready
+//       __syncthreads()                    // smem visibility for compute
+//       compute on buffer ((kk/BK)-1) & 1
+//       __syncthreads()                    // smem reuse safety
+//   wait_group 0; __syncthreads(); compute final tile
+#define TROPICAL_MATMUL_TILED_PIPELINED_BODY(T, PAIR, INIT_VAL, BETTER,        \
+    A_OFF, B_OFF, LOAD_A_DECOMP, LOAD_B_DECOMP,                                \
+    BM_, BN_, BK_, TM_, TN_)                                                   \
+{                                                                              \
+    __shared__ T   As_v[2][BK_][BM_ + 1];                                      \
+    __shared__ int As_c[2][BK_][BM_ + 1];                                      \
+    __shared__ T   Bs_v[2][BK_][BN_ + 1];                                      \
+    __shared__ int Bs_c[2][BK_][BN_ + 1];                                      \
+                                                                               \
+    int tx = threadIdx.x, ty = threadIdx.y;                                    \
+    int tid = ty * blockDim.x + tx;                                            \
+    int threads_per_block = blockDim.x * blockDim.y;                           \
+    int block_i0 = blockIdx.y * (BM_);                                         \
+    int block_j0 = blockIdx.x * (BN_);                                         \
+                                                                               \
+    T                  acc_v[TM_][TN_];                                        \
+    unsigned long long acc_c[TM_][TN_];                                        \
+    _Pragma("unroll")                                                          \
+    for (int ti = 0; ti < (TM_); ++ti)                                         \
+        _Pragma("unroll")                                                      \
+        for (int tj = 0; tj < (TN_); ++tj) {                                   \
+            acc_v[ti][tj] = (INIT_VAL);                                        \
+            acc_c[ti][tj] = 0ULL;                                              \
+        }                                                                      \
+                                                                               \
+    const unsigned long long Pull = (unsigned long long)P;                     \
+    const int A_TILE = (BM_) * (BK_);                                          \
+    const int B_TILE = (BN_) * (BK_);                                          \
+                                                                               \
+    auto issue_load_A = [&](int kk_base, int buf) {                            \
+        for (int idx = tid; idx < A_TILE; idx += threads_per_block) {          \
+            int sk_a, si_a;                                                    \
+            LOAD_A_DECOMP(idx, (BM_), (BK_), sk_a, si_a);                      \
+            int gi = block_i0 + si_a;                                          \
+            int gk = kk_base + sk_a;                                           \
+            if (gi < M && gk < K) {                                            \
+                const PAIR* gptr = &pair_a[A_OFF(gi, gk, M, K)];               \
+                if constexpr (sizeof(T) == 8) {                                \
+                    CP_ASYNC_CG_8(SMEM_PTR(&As_v[buf][sk_a][si_a]),            \
+                                  reinterpret_cast<const T*>(&gptr->val));     \
+                } else {                                                       \
+                    CP_ASYNC_CG_4(SMEM_PTR(&As_v[buf][sk_a][si_a]),            \
+                                  reinterpret_cast<const T*>(&gptr->val));     \
+                }                                                              \
+                CP_ASYNC_CG_4(SMEM_PTR(&As_c[buf][sk_a][si_a]),                \
+                              reinterpret_cast<const int*>(&gptr->cnt));       \
+            } else {                                                           \
+                As_v[buf][sk_a][si_a] = (INIT_VAL);                            \
+                As_c[buf][sk_a][si_a] = 0;                                     \
+            }                                                                  \
+        }                                                                      \
+    };                                                                         \
+    auto issue_load_B = [&](int kk_base, int buf) {                            \
+        for (int idx = tid; idx < B_TILE; idx += threads_per_block) {          \
+            int sk_b, sj_b;                                                    \
+            LOAD_B_DECOMP(idx, (BN_), (BK_), sk_b, sj_b);                      \
+            int gk = kk_base + sk_b;                                           \
+            int gj = block_j0 + sj_b;                                          \
+            if (gj < N && gk < K) {                                            \
+                const PAIR* gptr = &pair_b[B_OFF(gk, gj, K, N)];               \
+                if constexpr (sizeof(T) == 8) {                                \
+                    CP_ASYNC_CG_8(SMEM_PTR(&Bs_v[buf][sk_b][sj_b]),            \
+                                  reinterpret_cast<const T*>(&gptr->val));     \
+                } else {                                                       \
+                    CP_ASYNC_CG_4(SMEM_PTR(&Bs_v[buf][sk_b][sj_b]),            \
+                                  reinterpret_cast<const T*>(&gptr->val));     \
+                }                                                              \
+                CP_ASYNC_CG_4(SMEM_PTR(&Bs_c[buf][sk_b][sj_b]),                \
+                              reinterpret_cast<const int*>(&gptr->cnt));       \
+            } else {                                                           \
+                Bs_v[buf][sk_b][sj_b] = (INIT_VAL);                            \
+                Bs_c[buf][sk_b][sj_b] = 0;                                     \
+            }                                                                  \
+        }                                                                      \
+    };                                                                         \
+    auto compute_on = [&](int buf, int kk_end) {                               \
+        for (int kk2 = 0; kk2 < kk_end; ++kk2) {                               \
+            T   av[TM_]; int ac[TM_];                                          \
+            T   bv[TN_]; int bc[TN_];                                          \
+            _Pragma("unroll")                                                  \
+            for (int ti = 0; ti < (TM_); ++ti) {                               \
+                av[ti] = As_v[buf][kk2][ty * (TM_) + ti];                      \
+                ac[ti] = As_c[buf][kk2][ty * (TM_) + ti];                      \
+            }                                                                  \
+            _Pragma("unroll")                                                  \
+            for (int tj = 0; tj < (TN_); ++tj) {                               \
+                bv[tj] = Bs_v[buf][kk2][tx * (TN_) + tj];                      \
+                bc[tj] = Bs_c[buf][kk2][tx * (TN_) + tj];                      \
+            }                                                                  \
+            _Pragma("unroll")                                                  \
+            for (int ti = 0; ti < (TM_); ++ti)                                 \
+                _Pragma("unroll")                                              \
+                for (int tj = 0; tj < (TN_); ++tj) {                           \
+                    T pv = av[ti] + bv[tj];                                    \
+                    unsigned long long prod =                                  \
+                        (unsigned long long)(unsigned)ac[ti] *                 \
+                        (unsigned long long)(unsigned)bc[tj];                  \
+                    unsigned long long pc = barrett_mod(prod, Pull, MU);       \
+                    bool win = BETTER(pv, acc_v[ti][tj]);                      \
+                    bool tie = (pv == acc_v[ti][tj]);                          \
+                    acc_v[ti][tj] = win ? pv : acc_v[ti][tj];                  \
+                    acc_c[ti][tj] = win ? pc :                                 \
+                        (tie ? (acc_c[ti][tj] + pc) : acc_c[ti][tj]);          \
+                }                                                              \
+        }                                                                      \
+    };                                                                         \
+                                                                               \
+    /* Prefetch the first tile (kk=0) into buffer 0. */                       \
+    issue_load_A(0, 0);                                                        \
+    issue_load_B(0, 0);                                                        \
+    CP_ASYNC_COMMIT();                                                         \
+                                                                               \
+    int cur_buf = 0;                                                           \
+    for (int kk = (BK_); kk < K; kk += (BK_)) {                                \
+        int next_buf = 1 - cur_buf;                                            \
+        issue_load_A(kk, next_buf);                                            \
+        issue_load_B(kk, next_buf);                                            \
+        CP_ASYNC_COMMIT();                                                     \
+        CP_ASYNC_WAIT_GROUP(1);                                                \
+        __syncthreads();                                                       \
+                                                                               \
+        int kk_prev_end = (BK_);                                               \
+        compute_on(cur_buf, kk_prev_end);                                      \
+                                                                               \
+        __syncthreads();                                                       \
+        cur_buf = next_buf;                                                    \
+    }                                                                          \
+                                                                               \
+    /* Drain the final tile. */                                                \
+    CP_ASYNC_WAIT_GROUP(0);                                                    \
+    __syncthreads();                                                           \
+    int last_kk_base = ((K - 1) / (BK_)) * (BK_);                              \
+    int last_kk_end = K - last_kk_base; /* in [1, BK_] */                      \
+    compute_on(cur_buf, last_kk_end);                                          \
+                                                                               \
+    _Pragma("unroll")                                                          \
+    for (int ti = 0; ti < (TM_); ++ti) {                                       \
+        int gi = block_i0 + ty * (TM_) + ti;                                   \
+        if (gi >= M) continue;                                                 \
+        _Pragma("unroll")                                                      \
+        for (int tj = 0; tj < (TN_); ++tj) {                                   \
+            int gj = block_j0 + tx * (TN_) + tj;                               \
+            if (gj >= N) continue;                                             \
+            PAIR out;                                                          \
+            out.val = acc_v[ti][tj];                                           \
+            out.cnt = (int)barrett_mod(acc_c[ti][tj], Pull, MU);               \
+            out_c[gi + gj * M] = out;                                          \
+        }                                                                      \
+    }                                                                          \
+}
+
 #define DEFINE_TILED_F32(NAME, INIT_VAL, BETTER, A_OFF, B_OFF, LOAD_A, LOAD_B) \
 extern "C" __global__ void NAME(                                               \
     const PairF32* __restrict__ pair_a,                                        \
