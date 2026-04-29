@@ -20,7 +20,7 @@ using Graphs
 using Random
 using Printf
 
-const P = 65537                              # prime modulus, > 2^16 ≥ any count we'll see
+const P = 2147483647                          # M31 (2^31 − 1), max P our Int32 count supports
 const ELT = ModCountingTropical{Float32, P}
 
 # Tensor index a ∈ {1, 2}  →  spin {+1, -1}.
@@ -163,10 +163,80 @@ function demo_grid(; seed::Int = 2)
     println("  all three agree.\n")
 end
 
+# ---------------------------------------------------------------------------
+# Demo C: L×L grid benchmark. No brute force (2^(L²) is infeasible for L≥6);
+# verification is against GenericTensorNetworks. Times the OMEinsum + GPU
+# pipeline against GTN's CountingMax solve.
+# ---------------------------------------------------------------------------
+function build_grid_edges(L::Int)
+    edges = Tuple{Int,Int}[]
+    @inline vid(r, c) = (r - 1) * L + c
+    for r in 1:L, c in 1:L
+        if c < L; push!(edges, (vid(r, c), vid(r, c + 1))); end   # horizontal
+        if r < L; push!(edges, (vid(r, c), vid(r + 1, c))); end   # vertical
+    end
+    return edges
+end
+
+function bench_grid(L::Int; seed::Int = 42, ntrials_treesa::Int = 1, niters_treesa::Int = 5)
+    Random.seed!(seed)
+    N = L * L
+    edge_list = build_grid_edges(L)
+    Js = Float32.(rand([-1, 1], length(edge_list)))
+    edges_with_J = [(e, J) for (e, J) in zip(edge_list, Js)]
+    Es = [edge_tensor(J) for J in Js]
+
+    # OMEinsum: each spin gets a label string "v<index>". Indices repeated
+    # across edge tensors are summed (max-plus reduction over that spin).
+    labels = [Symbol("v", i) for i in 1:N]
+    edge_label_pairs = [[labels[i], labels[j]] for (i, j) in edge_list]
+    code = OMEinsum.EinCode(edge_label_pairs, Symbol[])
+
+    @printf "=== Demo C: %d×%d grid (%d spins, %d edges) ===\n" L L N length(edge_list)
+
+    # Time the contraction-order optimization (CPU, GTN does the same internally).
+    t_opt = @elapsed optcode = optimize_code(code, uniformsize(code, 2),
+        TreeSA(; ntrials=ntrials_treesa, niters=niters_treesa))
+    cc = contraction_complexity(optcode, uniformsize(code, 2))
+    @printf "  TreeSA optimize:        %8.3f s   tc=%g sc=%g rwc=%g\n" t_opt cc.tc cc.sc cc.rwc
+
+    # Warmup (NVRTC compile, kernel cache, etc.).
+    optcode(Es...); CUDA.synchronize()
+    # Measure kernel-driven contraction (warm).
+    t_kernel = @elapsed begin
+        res = optcode(Es...)
+        CUDA.synchronize()
+    end
+    res_host = Array(res::CuArray{ELT, 0})[]
+    score = res_host.n
+    count = Int(res_host.c)
+    @printf "  GPU contract (warm):    %8.3f s   score=%-8.1f count=%d\n" t_kernel score count
+
+    # GTN reference (CPU).
+    g = SimpleGraph(N)
+    for (i, j) in edge_list; add_edge!(g, i, j); end
+    Js_by_edge = Dict((min(i,j), max(i,j)) => J for ((i, j), J) in edges_with_J)
+    # Warmup GTN (compile-cost) — solve once, discard.
+    gtn_solve(g, Js_by_edge, N)
+    t_gtn = @elapsed gtn_score, gtn_count = gtn_solve(g, Js_by_edge, N)
+    @printf "  GTN solve   (warm):     %8.3f s   score=%-8.1f count=%d\n" t_gtn gtn_score gtn_count
+
+    if score == gtn_score && count == gtn_count
+        println("  ✓ kernel and GTN agree.\n")
+    else
+        @warn "kernel and GTN disagree" score count gtn_score gtn_count
+    end
+    return (; t_opt, t_kernel, t_gtn, score, count, gtn_score, gtn_count)
+end
+
 function main()
     @printf "GPU: %s\n\n" CUDA.name(CUDA.device())
     demo_chain()
     demo_grid()
+    println("--- benchmark (no brute force) ---\n")
+    bench_grid(6)
+    bench_grid(8)
+    bench_grid(10)
     println("All checks passed.")
 end
 
