@@ -62,7 +62,8 @@ end
 # and emit a coupling vector aligned to that.
 function gtn_solve(g::SimpleGraph,
                    Js_by_edge::Dict{Tuple{Int,Int}, Float32},
-                   N::Int)
+                   N::Int;
+                   usecuda::Bool = false)
     Js_canonical = Float64[]
     for e in edges(g)
         i, j = src(e), dst(e)
@@ -72,7 +73,11 @@ function gtn_solve(g::SimpleGraph,
     h = zeros(Float64, N)
     problem = SpinGlass(g, Js_canonical, h)
     tn = GenericTensorNetwork(problem)
-    res = solve(tn, CountingMax())[]
+    res_arr = solve(tn, CountingMax(); usecuda)
+    # solve(...) returns a 0-d array; on the CUDA path it's a CuArray{T,0}
+    # which forbids scalar indexing. Round-trip via Array to extract the
+    # single CountingTropical scalar.
+    res = (res_arr isa Array ? res_arr : Array(res_arr))[]
     return Float32(res.n), Int(res.c)
 end
 
@@ -240,11 +245,58 @@ end
 # ---------------------------------------------------------------------------
 # Demo D: CRT reconstruction. Run the GPU pipeline twice with two coprime
 # primes P1, P2 to obtain count mod P1 and count mod P2, then combine via
-# 2-prime CRT to recover the exact count modulo P1*P2. As long as
-# true_count < P1*P2 (~ 4.6e18 here), this is the integer count.
+# 2-prime CRT to recover the exact count modulo P1*P2.
+#
+# Prime choice (Spec Q): the GPU kernel has a defer-mod fast path that
+# requires `K · (P-1)² < 2^63`, where K is the largest matmul reduction
+# dim in the contraction. M31-class primes (P ≈ 2^31) violate this gate
+# and route to the ~2.4× slower Barrett-in-loop kernel. We instead pick
+# two primes near the largest P that keeps the fast path active for the
+# given K — this is faster even though P1·P2 is smaller, so the CRT
+# envelope is smaller. Keep `K_MAX_LOG2` generous enough to cover the
+# largest actual K in the contraction; the count_bound argument controls
+# how much margin we want over the expected count.
 # ---------------------------------------------------------------------------
-const _P1 = 2147483647   # M31 = 2^31 − 1, prime
-const _P2 = 2147483629   # 2^31 − 19, prime
+
+# Largest reduction dim K we expect to see in any single matmul step of
+# the OMEinsum contraction. For grid problems with bond dim 2 the
+# practical K rarely exceeds 2^20; raise this if a particular problem
+# shows kernel rejection.
+const K_MAX_LOG2 = 18
+
+function _is_prime(n::Integer)
+    n < 2 && return false
+    n < 4 && return true
+    iseven(n) && return false
+    n % 3 == 0 && return n == 3
+    d = 5
+    while d * d ≤ n
+        n % d == 0 && return false
+        n % (d + 2) == 0 && return false
+        d += 6
+    end
+    return true
+end
+
+function _prev_prime(n::Integer)
+    p = iseven(n) ? n - 1 : n
+    while p ≥ 3 && !_is_prime(p); p -= 2; end
+    return p
+end
+
+# Pick two distinct primes (P1 > P2) maximally below the fast-path
+# envelope. Both satisfy K_max · (P-1)² < 2^63, so the GPU kernel runs
+# the defer-mod fast path. Caller checks P1·P2 > expected count.
+function pick_fast_crt_primes(k_max_log2::Integer = K_MAX_LOG2)
+    # P-1 < floor(sqrt(2^63 / K_max))
+    pmax = isqrt(Int128(1) << (63 - k_max_log2))
+    pmax = min(pmax, Int128(2)^31 - 1)
+    p1 = _prev_prime(Int(pmax))
+    p2 = _prev_prime(p1 - 2)
+    return p1, p2
+end
+
+const _P1, _P2 = pick_fast_crt_primes(K_MAX_LOG2)
 @assert gcd(_P1, _P2) == 1
 
 function _edge_tensor_for(::Type{E}, J::Float32) where E
@@ -289,6 +341,7 @@ function demo_grid_crt(L::Int; seed::Int = 42, ntrials::Int = 5, niters::Int = 2
 
     @printf "=== Demo D: %d×%d grid CRT count reconstruction ===\n" L L
     @printf "  TreeSA optimize:        %8.3f s   tc=%g sc=%g\n" t_opt cc.tc cc.sc
+    @printf "  fast-path CRT primes:   P1=%d (%.1f bits)  P2=%d (%.1f bits)  P1·P2=%s (%.1f bits)\n" _P1 log2(_P1) _P2 log2(_P2) string(Int128(_P1)*Int128(_P2)) log2(Float64(Int128(_P1)*Int128(_P2)))
 
     score1, count1, t1 = _contract_with_P(ModCountingTropical{Float32, _P1}, optcode, Js)
     score2, count2, t2 = _contract_with_P(ModCountingTropical{Float32, _P2}, optcode, Js)
@@ -300,15 +353,21 @@ function demo_grid_crt(L::Int; seed::Int = 42, ntrials::Int = 5, niters::Int = 2
     @printf "  CRT-reconstructed exact count = %s\n" string(exact)
     @printf "  ground-state score = %s\n" string(score1)
 
-    # Cross-check against GTN.
+    # Cross-check against GTN — run its GPU path so it's an apples-to-apples
+    # GPU-vs-GPU comparison. (CPU path also available via `usecuda=false`.)
     g = SimpleGraph(N)
     for (i, j) in edge_list; add_edge!(g, i, j); end
     Js_by_edge = Dict((min(i,j), max(i,j)) => J for ((i, j), J) in edges_with_J)
-    t_gtn = @elapsed gtn_score, gtn_count = gtn_solve(g, Js_by_edge, N)
-    @printf "  GTN reference: %8.3f s   exact count = %d\n" t_gtn gtn_count
+    gtn_solve(g, Js_by_edge, N; usecuda=true); CUDA.synchronize()  # GTN-GPU warmup
+    t_gtn = @elapsed begin
+        gtn_score, gtn_count = gtn_solve(g, Js_by_edge, N; usecuda=true)
+        CUDA.synchronize()
+    end
+    @printf "  GTN-GPU reference: %8.3f s   exact count = %d\n" t_gtn gtn_count
+    @printf "  speedup over GTN-GPU:           %.2f×  (ours = %.3f s for both passes)\n" (t_gtn / (t1 + t2)) (t1 + t2)
 
     if Int128(score1) == Int128(gtn_score) && exact == Int128(gtn_count)
-        println("  ✓ CRT reconstruction matches GTN exactly.\n")
+        println("  ✓ CRT reconstruction matches GTN-GPU exactly.\n")
     else
         @warn "disagreement" score1 gtn_score exact gtn_count
     end

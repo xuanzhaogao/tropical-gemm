@@ -36,3 +36,4 @@ lcov.info
 
 data/
 /CountingTropicalGEMM.jl/Manifest.toml
+bench_run.log

@@ -260,6 +260,42 @@ the unmodified Spec N sync kernel.
 - **Defer-mod safety gate** unit-tested (`gate_tests::*`): K * (P-1)² <
   2^63 picks `_pl`, otherwise falls back to the always-correct sync.
 
+## A100-SXM4-80GB head-to-head vs Julia auto-compiled `mul!` — 2026-04-29
+
+Direct kernel comparison: our `tropical_matmul('N','N', A, B)` on
+`CuMatrix{ModCountingTropical{Float32, 2965819}}` (22-bit prime, fast
+path) vs `LinearAlgebra.mul!` on `CuMatrix{CountingTropical{Float64,
+Int64}}` (the GenericTensorNetworks-GPU element type). Both go through
+their respective single-kernel matmul; min-of-N-reps reported. Bench
+script: `examples/bench_kernel_vs_julia.jl`.
+
+| Shape | ours ms | ours G/s | julia ms | julia G/s | speedup |
+|---:|---:|---:|---:|---:|---:|
+| 512³ | 0.32 | 836 | 0.43 | 618 | 1.35× |
+| 1024³ | 1.69 | 1268 | 4.02 | 535 | 2.37× |
+| 2048³ | 11.11 | 1546 | 45.77 | 375 | 4.12× |
+| 4096³ | 80.69 | 1703 | 622.88 | 221 | 7.72× |
+| 8192³ | 653.27 | 1683 | 5336.32 | 206 | 8.17× |
+| 16384³ | 5212.14 | 1688 | 43239.72 | 203 | 8.30× |
+| 32768³ | 41742.36 | **1686** | 348404.82 | 202 | **8.35×** |
+
+### Observations
+
+- **Our kernel scales flat at ~1.69 TG/s from 4096³ all the way to
+  32768³.** No degradation at the largest shape; well-aligned with the
+  ~2 TG/s historical Spec K ceiling.
+- **Julia auto-compiled `mul!` plateaus at ~200 G/s** for any shape
+  ≥ 4096³ — that's the GPUArrays generic GEMM bound on a non-standard
+  semiring (no per-element fusion, two scalar fields, generic
+  reduction).
+- **Speedup grows with size** because Julia's per-element overhead is
+  fixed while ours scales with hardware bandwidth/compute. The ratio
+  asymptotes at ~8.3× — both kernels are now compute-bound.
+- 32768³ wall: 42 s for us vs **5 min 48 s** for the Julia path. At
+  L=40 / L=50 spin-glass scales (where the contraction is dominated
+  by these huge matmuls), this 8× per-matmul edge translates directly
+  to end-to-end wins, even with 2-pass CRT factor.
+
 ## H100
 
 Pending — no H100 available at the time of writing. Re-run on A100-80GB
