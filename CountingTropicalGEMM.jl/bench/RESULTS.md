@@ -104,14 +104,60 @@ Shared-memory tiled kernel with layout-aware coalesced loads
   launch-overhead-bound regardless and would need a small-shape path
   (warpk-style) to address.
 
-## A100 / H100
+## A100-SXM4-80GB (Spec N tiled) — 2026-04-29
 
-Pending — no A100 free at the time of writing. Re-run on A100-80GB
+Same kernel and tile sizes as RTX 6000 (BM=BN=64, BK=8, TM=TN=4 for f32).
+Run on `workergpu049`.
+
+| Shape | flag | ms / call | G tropical-ops/s |
+|---:|:---:|---:|---:|
+| 128³ | NN | 0.213 | 19.7 |
+| 128³ | NT | 0.237 | 17.7 |
+| 128³ | TN | 0.237 | 17.7 |
+| 128³ | TT | 0.213 | 19.7 |
+| 256³ | NN | 0.407 | 82.5 |
+| 256³ | NT | 0.463 | 72.4 |
+| 256³ | TN | 0.456 | 73.5 |
+| 256³ | TT | 0.411 | 81.6 |
+| 512³ | NN | 0.809 | 331.7 |
+| 512³ | NT | 0.880 | 305.1 |
+| 512³ | TN | 0.880 | 305.0 |
+| 512³ | TT | 0.784 | 342.6 |
+| 1024³ | NN | 4.167 | 515.4 |
+| 1024³ | NT | 4.136 | 519.2 |
+| 1024³ | TN | 4.027 | 533.2 |
+| 1024³ | TT | 3.833 | 560.2 |
+| 2048³ | NN | 24.553 | 699.7 |
+| 2048³ | NT | 25.388 | 676.7 |
+| 2048³ | TN | 25.529 | 673.0 |
+| 2048³ | TT | 24.541 | 700.0 |
+| 4096³ | NN | 184.497 | 744.9 |
+| 4096³ | NT | 190.298 | 722.2 |
+| 4096³ | TN | 190.922 | 719.9 |
+| 4096³ | TT | 184.287 | 745.8 |
+
+### Observations
+
+- **A100 only ~15% ahead of RTX 6000 at peak** (746 vs 647 G/s at 4096³ TT).
+  The kernel's fixed sm_75-tuned tile geometry leaves A100's bigger SM
+  count, larger register file, and HBM3-class bandwidth on the table.
+  An A100-specific tile (e.g. BM=BN=128, BK=16, TM=TN=8) and async
+  shared-mem loads (`cp.async`) would likely close the gap to A100's
+  ~2 TB/s ceiling for this kernel pattern. Follow-on spec.
+- **Cross-flag spread on A100 mirrors RTX 6000** — within ~5% of each
+  other at every size. Layout-aware loading carries over cleanly.
+
+## H100
+
+Pending — no H100 available at the time of writing. Re-run on A100-80GB
 (SXM4 if available) and append. Expected throughput per Spec K precedent:
 - A100 NN at 4096³: ~250-350 G/s (likely worse than Spec K's 666 due to
   the column-major NN's uncoalesced B access — same 4× gap as on RTX
   6000 means ~1/4 of A100's coalesced ceiling).
 - A100 TT at 4096³: ~1500-2000 G/s if the coalesced access dominates.
+
+These predictions were superseded by Spec N's tiled kernel — see the
+A100 section above. Actual measured A100 4096³ TT = 746 G/s.
 
 H100 numbers should scale roughly with HBM3 bandwidth (3.35 TB/s vs.
 A100's 1555 GB/s = ~2.15×).
