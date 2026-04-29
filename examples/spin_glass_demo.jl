@@ -178,7 +178,8 @@ function build_grid_edges(L::Int)
     return edges
 end
 
-function bench_grid(L::Int; seed::Int = 42, ntrials_treesa::Int = 1, niters_treesa::Int = 5)
+function bench_grid(L::Int; seed::Int = 42, ntrials_treesa::Int = 1, niters_treesa::Int = 5,
+                    sc_skip::Real = 18, run_gtn::Bool = true)
     Random.seed!(seed)
     N = L * L
     edge_list = build_grid_edges(L)
@@ -199,6 +200,11 @@ function bench_grid(L::Int; seed::Int = 42, ntrials_treesa::Int = 1, niters_tree
         TreeSA(; ntrials=ntrials_treesa, niters=niters_treesa))
     cc = contraction_complexity(optcode, uniformsize(code, 2))
     @printf "  TreeSA optimize:        %8.3f s   tc=%g sc=%g rwc=%g\n" t_opt cc.tc cc.sc cc.rwc
+
+    if cc.sc > sc_skip
+        @printf "  largest intermediate dim ≈ 2^%g = %g elems × 8 B = %.2f GB — skipping (sc>%g)\n" cc.sc 2.0^cc.sc 2.0^cc.sc * 8 / 1e9 sc_skip
+        return (; t_opt, t_kernel = NaN, t_gtn = NaN, score = NaN, count = -1, gtn_score = NaN, gtn_count = -1, sc = cc.sc)
+    end
 
     # Warmup (NVRTC compile, kernel cache, etc.).
     optcode(Es...); CUDA.synchronize()
@@ -223,6 +229,8 @@ function bench_grid(L::Int; seed::Int = 42, ntrials_treesa::Int = 1, niters_tree
 
     if score == gtn_score && count == gtn_count
         println("  ✓ kernel and GTN agree.\n")
+    elseif score == gtn_score && count == mod(Int(gtn_count), P)
+        @printf "  ✓ score matches; count overflows P=%d (kernel = GTN mod P).\n\n" P
     else
         @warn "kernel and GTN disagree" score count gtn_score gtn_count
     end
@@ -237,6 +245,9 @@ function main()
     bench_grid(6)
     bench_grid(8)
     bench_grid(10)
+    bench_grid(12)
+    bench_grid(14)
+    bench_grid(20; ntrials_treesa = 5, niters_treesa = 20, sc_skip = 26)
     println("All checks passed.")
 end
 
