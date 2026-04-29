@@ -30,6 +30,44 @@ __device__ __forceinline__ unsigned long long barrett_mod(
     return r;
 }
 
+// ---- Spec P: cp.async helpers (sm_80+) ------------------------------------
+//
+// `cp.async.cg.shared.global` performs an asynchronous 4/8/16-byte copy
+// from global memory into shared memory without occupying a register and
+// without blocking the issuing warp. The copy is committed to a "group"
+// via `cp.async.commit_group` and waited on with `cp.async.wait_group N`,
+// which blocks until at most N groups are still in flight.
+//
+// `.cg` (cache global) is the right hint for streaming loads we read once
+// per K-tile. Use `.ca` if subsequent re-reads from L1 would help (not
+// our case).
+//
+// CP_ASYNC_CG_4 copies 4 bytes (one f32 or one i32). CP_ASYNC_CG_8 copies
+// 8 bytes (a double or a PairF32). PairF64's 16 B is moved as one 8-byte
+// cp.async for the `val` (double) plus one 4-byte cp.async for `cnt`
+// (int). The 4-byte `_pad` slot is left untouched in shared memory; the
+// compute phase never reads it.
+#if __CUDA_ARCH__ >= 800
+#define CP_ASYNC_CG_4(smem_ptr_u32, gmem_ptr) \
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 4;\n" :: "r"(smem_ptr_u32), "l"(gmem_ptr))
+#define CP_ASYNC_CG_8(smem_ptr_u32, gmem_ptr) \
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 8;\n" :: "r"(smem_ptr_u32), "l"(gmem_ptr))
+#define CP_ASYNC_COMMIT()  asm volatile("cp.async.commit_group;\n" ::)
+#define CP_ASYNC_WAIT_GROUP(N) asm volatile("cp.async.wait_group %0;\n" :: "n"(N))
+// __cvta_generic_to_shared converts a generic shared pointer to the
+// 32-bit shared-state-space address that cp.async expects.
+#define SMEM_PTR(ptr) static_cast<unsigned>(__cvta_generic_to_shared(ptr))
+#else
+// Stubs for sm_<80; the pipelined kernel will not be launched there, but
+// it must still compile so NVRTC can build all 16 specializations on a
+// shared NVRTC pass.
+#define CP_ASYNC_CG_4(s, g) do { (void)(s); (void)(g); } while (0)
+#define CP_ASYNC_CG_8(s, g) do { (void)(s); (void)(g); } while (0)
+#define CP_ASYNC_COMMIT()
+#define CP_ASYNC_WAIT_GROUP(N) ((void)0)
+#define SMEM_PTR(ptr) 0u
+#endif
+
 struct __align__(8)  PairF32 { float  val; int cnt; };
 struct __align__(16) PairF64 { double val; int cnt; int _pad; };
 
