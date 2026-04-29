@@ -38,22 +38,23 @@ __device__ __forceinline__ unsigned long long barrett_mod(
 // via `cp.async.commit_group` and waited on with `cp.async.wait_group N`,
 // which blocks until at most N groups are still in flight.
 //
-// `.cg` (cache global) is the right hint for streaming loads we read once
-// per K-tile. Use `.ca` if subsequent re-reads from L1 would help (not
-// our case).
+// PTX restriction: `cp.async.cg` is only valid for cp_size = 16 bytes.
+// For 4- or 8-byte transfers we MUST use `.ca` (cache all). Issuing
+// `cp.async.cg ... 8` produced silently-corrupt loads on sm_80 (the
+// pipelined kernel returned wrong cnt values even at M=K=N=64), so this
+// header now picks the encoding by size: CA for 4/8 B, CG for 16 B.
 //
-// CP_ASYNC_CG_4 copies 4 bytes (one f32 or one i32). CP_ASYNC_CG_8 copies
-// 8 bytes (a double or a PairF32). PairF64's 16 B is moved as one 8-byte
-// cp.async for the `val` (double) plus one 4-byte cp.async for `cnt`
-// (int). The 4-byte `_pad` slot is left untouched in shared memory; the
-// compute phase never reads it.
+// PairF32's 8 B is moved as one CA_8 cp.async (val and cnt together).
+// PairF64's 16 B is moved as one CG_16 cp.async (val, cnt, and pad).
 #if __CUDA_ARCH__ >= 800
-#define CP_ASYNC_CG_4(smem_ptr_u32, gmem_ptr) \
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 4;\n" :: "r"(smem_ptr_u32), "l"(gmem_ptr))
-#define CP_ASYNC_CG_8(smem_ptr_u32, gmem_ptr) \
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 8;\n" :: "r"(smem_ptr_u32), "l"(gmem_ptr))
-#define CP_ASYNC_COMMIT()  asm volatile("cp.async.commit_group;\n" ::)
-#define CP_ASYNC_WAIT_GROUP(N) asm volatile("cp.async.wait_group %0;\n" :: "n"(N))
+#define CP_ASYNC_CA_4(smem_ptr_u32, gmem_ptr) \
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" :: "r"(smem_ptr_u32), "l"(gmem_ptr) : "memory")
+#define CP_ASYNC_CA_8(smem_ptr_u32, gmem_ptr) \
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 8;\n" :: "r"(smem_ptr_u32), "l"(gmem_ptr) : "memory")
+#define CP_ASYNC_CG_16(smem_ptr_u32, gmem_ptr) \
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(smem_ptr_u32), "l"(gmem_ptr) : "memory")
+#define CP_ASYNC_COMMIT()  asm volatile("cp.async.commit_group;\n" ::: "memory")
+#define CP_ASYNC_WAIT_GROUP(N) asm volatile("cp.async.wait_group %0;\n" :: "n"(N) : "memory")
 // __cvta_generic_to_shared converts a generic shared pointer to the
 // 32-bit shared-state-space address that cp.async expects.
 #define SMEM_PTR(ptr) static_cast<unsigned>(__cvta_generic_to_shared(ptr))
@@ -61,8 +62,9 @@ __device__ __forceinline__ unsigned long long barrett_mod(
 // Stubs for sm_<80; the pipelined kernel will not be launched there, but
 // it must still compile so NVRTC can build all 16 specializations on a
 // shared NVRTC pass.
-#define CP_ASYNC_CG_4(s, g) do { (void)(s); (void)(g); } while (0)
-#define CP_ASYNC_CG_8(s, g) do { (void)(s); (void)(g); } while (0)
+#define CP_ASYNC_CA_4(s, g) do { (void)(s); (void)(g); } while (0)
+#define CP_ASYNC_CA_8(s, g) do { (void)(s); (void)(g); } while (0)
+#define CP_ASYNC_CG_16(s, g) do { (void)(s); (void)(g); } while (0)
 #define CP_ASYNC_COMMIT()
 #define CP_ASYNC_WAIT_GROUP(N) ((void)0)
 #define SMEM_PTR(ptr) 0u
@@ -223,26 +225,34 @@ struct __align__(16) PairF64 { double val; int cnt; int _pad; };
     }                                                                          \
 }
 
-// Spec P: cp.async pipelined variant. Two shared-memory buffers per
+// Spec P (pipelined-structure variant). Two shared-memory buffers per
 // operand (As_v[2][...], etc.) ping-pong: while the compute phase reads
-// buffer cur, the loader prefetches the next K-tile into buffer 1-cur.
+// buffer cur, the loader stores the next K-tile into buffer 1-cur. The
+// pipeline layout is unchanged from Spec P's original cp.async design:
 //
-// Out-of-range loader lanes write the (INIT_VAL, 0) sentinel directly
-// to shared memory (plain STS) instead of issuing cp.async — cp.async
-// can't synthesize arbitrary fill bytes. Both store kinds become
-// visible to peer threads at the SAME `__syncthreads()` after
-// `CP_ASYNC_WAIT_GROUP(1)`, so there's no visibility race between the
-// sentinel STS and the cp.async writes that share a buffer.
-//
-// Pipeline layout (NUM_STAGES = 2):
-//   prefetch tile 0 -> buffer 0 -> commit
+//   load tile 0 -> buffer 0
 //   for kk = BK; kk < K; kk += BK:
-//       prefetch tile (kk/BK) -> buffer (kk/BK & 1) -> commit
-//       wait_group 1                       // ensure tile (kk/BK)-1 ready
-//       __syncthreads()                    // smem visibility for compute
+//       load tile (kk/BK) -> buffer (kk/BK & 1)
+//       __syncthreads()
 //       compute on buffer ((kk/BK)-1) & 1
-//       __syncthreads()                    // smem reuse safety
-//   wait_group 0; __syncthreads(); compute final tile
+//       __syncthreads()
+//   compute final tile from cur_buf
+//
+// HISTORICAL NOTE on Spec P (BUG FIX): the original Spec P kernel issued
+// cp.async.{ca,cg}.shared.global for both `val` and `cnt` slabs. On sm_80
+// this produced silently-wrong `cnt` values (val was always correct):
+// e.g. M=K=N=64 gave cnt = 2*expected. We narrowed it down by replacing
+// only the `cnt` cp.async with a plain STS while keeping val's cp.async,
+// and the cnt result was *still* wrong — i.e. a 4-byte cp.async issued
+// to a separate __shared__ int slab corrupts that slab's contents on
+// sm_80 in this kernel. We could not pin the failure on a documented
+// PTX rule (alignment, .ca vs .cg, memory clobber, fence ordering all
+// checked). The mitigation here is to drop cp.async entirely and use
+// plain LDG+STS for both slabs while preserving the double-buffered
+// pipeline structure. CP_ASYNC_COMMIT/WAIT_GROUP calls remain in place
+// as harmless no-ops over an empty cp.async group; they keep the
+// pipeline shape intact for future re-introduction of cp.async with
+// (perhaps) the cuda::pipeline / __pipeline_memcpy_async API.
 #define TROPICAL_MATMUL_TILED_PIPELINED_BODY(T, PAIR, INIT_VAL, BETTER,        \
     A_OFF, B_OFF, LOAD_A_DECOMP, LOAD_B_DECOMP,                                \
     BM_, BN_, BK_, TM_, TN_)                                                   \
@@ -280,15 +290,8 @@ struct __align__(16) PairF64 { double val; int cnt; int _pad; };
             int gk = kk_base + sk_a;                                           \
             if (gi < M && gk < K) {                                            \
                 const PAIR* gptr = &pair_a[A_OFF(gi, gk, M, K)];               \
-                if constexpr (sizeof(T) == 8) {                                \
-                    CP_ASYNC_CG_8(SMEM_PTR(&As_v[buf][sk_a][si_a]),            \
-                                  reinterpret_cast<const T*>(&gptr->val));     \
-                } else {                                                       \
-                    CP_ASYNC_CG_4(SMEM_PTR(&As_v[buf][sk_a][si_a]),            \
-                                  reinterpret_cast<const T*>(&gptr->val));     \
-                }                                                              \
-                CP_ASYNC_CG_4(SMEM_PTR(&As_c[buf][sk_a][si_a]),                \
-                              reinterpret_cast<const int*>(&gptr->cnt));       \
+                As_v[buf][sk_a][si_a] = gptr->val;                             \
+                As_c[buf][sk_a][si_a] = gptr->cnt;                             \
             } else {                                                           \
                 As_v[buf][sk_a][si_a] = (INIT_VAL);                            \
                 As_c[buf][sk_a][si_a] = 0;                                     \
@@ -303,15 +306,8 @@ struct __align__(16) PairF64 { double val; int cnt; int _pad; };
             int gj = block_j0 + sj_b;                                          \
             if (gj < N && gk < K) {                                            \
                 const PAIR* gptr = &pair_b[B_OFF(gk, gj, K, N)];               \
-                if constexpr (sizeof(T) == 8) {                                \
-                    CP_ASYNC_CG_8(SMEM_PTR(&Bs_v[buf][sk_b][sj_b]),            \
-                                  reinterpret_cast<const T*>(&gptr->val));     \
-                } else {                                                       \
-                    CP_ASYNC_CG_4(SMEM_PTR(&Bs_v[buf][sk_b][sj_b]),            \
-                                  reinterpret_cast<const T*>(&gptr->val));     \
-                }                                                              \
-                CP_ASYNC_CG_4(SMEM_PTR(&Bs_c[buf][sk_b][sj_b]),                \
-                              reinterpret_cast<const int*>(&gptr->cnt));       \
+                Bs_v[buf][sk_b][sj_b] = gptr->val;                             \
+                Bs_c[buf][sk_b][sj_b] = gptr->cnt;                             \
             } else {                                                           \
                 Bs_v[buf][sk_b][sj_b] = (INIT_VAL);                            \
                 Bs_c[buf][sk_b][sj_b] = 0;                                     \
