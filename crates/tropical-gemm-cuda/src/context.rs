@@ -100,6 +100,23 @@ const COUNTING_KERNEL_NAMES: &[&str] = &[
     "tropical_matmul_f64_min_NT_pl",
     "tropical_matmul_f64_min_TN_pl",
     "tropical_matmul_f64_min_TT_pl",
+    // Spec R: u32 cnt accumulator variants (sm_80+, K·(P-1)² < 2^32).
+    "tropical_matmul_f32_max_NN_plu32",
+    "tropical_matmul_f32_max_NT_plu32",
+    "tropical_matmul_f32_max_TN_plu32",
+    "tropical_matmul_f32_max_TT_plu32",
+    "tropical_matmul_f32_min_NN_plu32",
+    "tropical_matmul_f32_min_NT_plu32",
+    "tropical_matmul_f32_min_TN_plu32",
+    "tropical_matmul_f32_min_TT_plu32",
+    "tropical_matmul_f64_max_NN_plu32",
+    "tropical_matmul_f64_max_NT_plu32",
+    "tropical_matmul_f64_max_TN_plu32",
+    "tropical_matmul_f64_max_TT_plu32",
+    "tropical_matmul_f64_min_NN_plu32",
+    "tropical_matmul_f64_min_NT_plu32",
+    "tropical_matmul_f64_min_TN_plu32",
+    "tropical_matmul_f64_min_TT_plu32",
 ];
 
 /// CUDA context for tropical GEMM operations.

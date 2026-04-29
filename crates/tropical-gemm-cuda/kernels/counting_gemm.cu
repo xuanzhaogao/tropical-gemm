@@ -263,7 +263,11 @@ struct __align__(16) PairF64 { double val; int cnt; int _pad; };
 // as harmless no-ops over an empty cp.async group; they keep the
 // pipeline shape intact for future re-introduction of cp.async with
 // (perhaps) the cuda::pipeline / __pipeline_memcpy_async API.
-#define TROPICAL_MATMUL_TILED_PIPELINED_BODY(T, PAIR, INIT_VAL, BETTER,        \
+// ACC_T is the cnt accumulator type: `unsigned long long` for the general
+// defer-mod fast path (gate K·(P-1)² < 2^63), `unsigned int` for the small-P
+// fast path (gate K·(P-1)² < 2^32). The second saves IMAD.WIDE.U32 + IMAD.X
+// carries per FMA — empirically ~1.7× over the u64 form on A100 at P≤7.
+#define TROPICAL_MATMUL_TILED_PIPELINED_BODY(T, ACC_T, PAIR, INIT_VAL, BETTER, \
     A_OFF, B_OFF, LOAD_A_DECOMP, LOAD_B_DECOMP,                                \
     BM_, BN_, BK_, TM_, TN_)                                                   \
 {                                                                              \
@@ -278,14 +282,14 @@ struct __align__(16) PairF64 { double val; int cnt; int _pad; };
     int block_i0 = blockIdx.y * (BM_);                                         \
     int block_j0 = blockIdx.x * (BN_);                                         \
                                                                                \
-    T                  acc_v[TM_][TN_];                                        \
-    unsigned long long acc_c[TM_][TN_];                                        \
+    T     acc_v[TM_][TN_];                                                     \
+    ACC_T acc_c[TM_][TN_];                                                     \
     _Pragma("unroll")                                                          \
     for (int ti = 0; ti < (TM_); ++ti)                                         \
         _Pragma("unroll")                                                      \
         for (int tj = 0; tj < (TN_); ++tj) {                                   \
             acc_v[ti][tj] = (INIT_VAL);                                        \
-            acc_c[ti][tj] = 0ULL;                                              \
+            acc_c[ti][tj] = (ACC_T)0;                                          \
         }                                                                      \
                                                                                \
     const unsigned long long Pull = (unsigned long long)P;                     \
@@ -343,11 +347,10 @@ struct __align__(16) PairF64 { double val; int cnt; int _pad; };
                 _Pragma("unroll")                                              \
                 for (int tj = 0; tj < (TN_); ++tj) {                           \
                     T pv = av[ti] + bv[tj];                                    \
-                    /* PROBE: defer-mod fast path. acc_c grows raw; mod only   \
-                       at epilogue. Safe when K*(P-1)^2 fits in u64 (small P). */ \
-                    unsigned long long prod =                                  \
-                        (unsigned long long)(unsigned)ac[ti] *                 \
-                        (unsigned long long)(unsigned)bc[tj];                  \
+                    /* defer-mod: acc_c absorbs raw products in ACC_T; one    \
+                       Barrett at epilogue. Gate enforced by launcher. */     \
+                    ACC_T prod =                                               \
+                        (ACC_T)(unsigned)ac[ti] * (ACC_T)(unsigned)bc[tj];     \
                     bool win = BETTER(pv, acc_v[ti][tj]);                      \
                     bool tie = (pv == acc_v[ti][tj]);                          \
                     acc_v[ti][tj] = win ? pv : acc_v[ti][tj];                  \
@@ -440,39 +443,59 @@ DEFINE_TILED_F64(tropical_matmul_f64_min_NT, POS_INF_F64, MIN_BETTER, A_OFF_N, B
 DEFINE_TILED_F64(tropical_matmul_f64_min_TN, POS_INF_F64, MIN_BETTER, A_OFF_T, B_OFF_N, LOAD_A_DECOMP_T, LOAD_B_DECOMP_N)
 DEFINE_TILED_F64(tropical_matmul_f64_min_TT, POS_INF_F64, MIN_BETTER, A_OFF_T, B_OFF_T, LOAD_A_DECOMP_T, LOAD_B_DECOMP_T)
 
-#define DEFINE_TILED_F32_PIPELINED(NAME, INIT_VAL, BETTER, A_OFF, B_OFF, LOAD_A, LOAD_B) \
+#define DEFINE_TILED_F32_PIPELINED(NAME, ACC_T, INIT_VAL, BETTER, A_OFF, B_OFF, LOAD_A, LOAD_B) \
 extern "C" __global__ void NAME(                                               \
     const PairF32* __restrict__ pair_a,                                        \
     const PairF32* __restrict__ pair_b,                                        \
     PairF32* __restrict__ out_c,                                               \
     int M, int N, int K, int P, unsigned long long MU                          \
 )                                                                              \
-TROPICAL_MATMUL_TILED_PIPELINED_BODY(float, PairF32, INIT_VAL, BETTER, A_OFF, B_OFF, \
+TROPICAL_MATMUL_TILED_PIPELINED_BODY(float, ACC_T, PairF32, INIT_VAL, BETTER, A_OFF, B_OFF, \
                                      LOAD_A, LOAD_B, 64, 64, 16, 4, 4)
 
-#define DEFINE_TILED_F64_PIPELINED(NAME, INIT_VAL, BETTER, A_OFF, B_OFF, LOAD_A, LOAD_B) \
+#define DEFINE_TILED_F64_PIPELINED(NAME, ACC_T, INIT_VAL, BETTER, A_OFF, B_OFF, LOAD_A, LOAD_B) \
 extern "C" __global__ void NAME(                                               \
     const PairF64* __restrict__ pair_a,                                        \
     const PairF64* __restrict__ pair_b,                                        \
     PairF64* __restrict__ out_c,                                               \
     int M, int N, int K, int P, unsigned long long MU                          \
 )                                                                              \
-TROPICAL_MATMUL_TILED_PIPELINED_BODY(double, PairF64, INIT_VAL, BETTER, A_OFF, B_OFF, \
+TROPICAL_MATMUL_TILED_PIPELINED_BODY(double, ACC_T, PairF64, INIT_VAL, BETTER, A_OFF, B_OFF, \
                                      LOAD_A, LOAD_B, 32, 32, 8, 2, 4)
 
-DEFINE_TILED_F32_PIPELINED(tropical_matmul_f32_max_NN_pl, NEG_INF_F32, MAX_BETTER, A_OFF_N, B_OFF_N, LOAD_A_DECOMP_N, LOAD_B_DECOMP_N)
-DEFINE_TILED_F32_PIPELINED(tropical_matmul_f32_max_NT_pl, NEG_INF_F32, MAX_BETTER, A_OFF_N, B_OFF_T, LOAD_A_DECOMP_N, LOAD_B_DECOMP_T)
-DEFINE_TILED_F32_PIPELINED(tropical_matmul_f32_max_TN_pl, NEG_INF_F32, MAX_BETTER, A_OFF_T, B_OFF_N, LOAD_A_DECOMP_T, LOAD_B_DECOMP_N)
-DEFINE_TILED_F32_PIPELINED(tropical_matmul_f32_max_TT_pl, NEG_INF_F32, MAX_BETTER, A_OFF_T, B_OFF_T, LOAD_A_DECOMP_T, LOAD_B_DECOMP_T)
-DEFINE_TILED_F32_PIPELINED(tropical_matmul_f32_min_NN_pl, POS_INF_F32, MIN_BETTER, A_OFF_N, B_OFF_N, LOAD_A_DECOMP_N, LOAD_B_DECOMP_N)
-DEFINE_TILED_F32_PIPELINED(tropical_matmul_f32_min_NT_pl, POS_INF_F32, MIN_BETTER, A_OFF_N, B_OFF_T, LOAD_A_DECOMP_N, LOAD_B_DECOMP_T)
-DEFINE_TILED_F32_PIPELINED(tropical_matmul_f32_min_TN_pl, POS_INF_F32, MIN_BETTER, A_OFF_T, B_OFF_N, LOAD_A_DECOMP_T, LOAD_B_DECOMP_N)
-DEFINE_TILED_F32_PIPELINED(tropical_matmul_f32_min_TT_pl, POS_INF_F32, MIN_BETTER, A_OFF_T, B_OFF_T, LOAD_A_DECOMP_T, LOAD_B_DECOMP_T)
-DEFINE_TILED_F64_PIPELINED(tropical_matmul_f64_max_NN_pl, NEG_INF_F64, MAX_BETTER, A_OFF_N, B_OFF_N, LOAD_A_DECOMP_N, LOAD_B_DECOMP_N)
-DEFINE_TILED_F64_PIPELINED(tropical_matmul_f64_max_NT_pl, NEG_INF_F64, MAX_BETTER, A_OFF_N, B_OFF_T, LOAD_A_DECOMP_N, LOAD_B_DECOMP_T)
-DEFINE_TILED_F64_PIPELINED(tropical_matmul_f64_max_TN_pl, NEG_INF_F64, MAX_BETTER, A_OFF_T, B_OFF_N, LOAD_A_DECOMP_T, LOAD_B_DECOMP_N)
-DEFINE_TILED_F64_PIPELINED(tropical_matmul_f64_max_TT_pl, NEG_INF_F64, MAX_BETTER, A_OFF_T, B_OFF_T, LOAD_A_DECOMP_T, LOAD_B_DECOMP_T)
-DEFINE_TILED_F64_PIPELINED(tropical_matmul_f64_min_NN_pl, POS_INF_F64, MIN_BETTER, A_OFF_N, B_OFF_N, LOAD_A_DECOMP_N, LOAD_B_DECOMP_N)
-DEFINE_TILED_F64_PIPELINED(tropical_matmul_f64_min_NT_pl, POS_INF_F64, MIN_BETTER, A_OFF_N, B_OFF_T, LOAD_A_DECOMP_N, LOAD_B_DECOMP_T)
-DEFINE_TILED_F64_PIPELINED(tropical_matmul_f64_min_TN_pl, POS_INF_F64, MIN_BETTER, A_OFF_T, B_OFF_N, LOAD_A_DECOMP_T, LOAD_B_DECOMP_N)
-DEFINE_TILED_F64_PIPELINED(tropical_matmul_f64_min_TT_pl, POS_INF_F64, MIN_BETTER, A_OFF_T, B_OFF_T, LOAD_A_DECOMP_T, LOAD_B_DECOMP_T)
+// _pl = u64 cnt accumulator (gate K·(P-1)² < 2^63).
+DEFINE_TILED_F32_PIPELINED(tropical_matmul_f32_max_NN_pl, unsigned long long, NEG_INF_F32, MAX_BETTER, A_OFF_N, B_OFF_N, LOAD_A_DECOMP_N, LOAD_B_DECOMP_N)
+DEFINE_TILED_F32_PIPELINED(tropical_matmul_f32_max_NT_pl, unsigned long long, NEG_INF_F32, MAX_BETTER, A_OFF_N, B_OFF_T, LOAD_A_DECOMP_N, LOAD_B_DECOMP_T)
+DEFINE_TILED_F32_PIPELINED(tropical_matmul_f32_max_TN_pl, unsigned long long, NEG_INF_F32, MAX_BETTER, A_OFF_T, B_OFF_N, LOAD_A_DECOMP_T, LOAD_B_DECOMP_N)
+DEFINE_TILED_F32_PIPELINED(tropical_matmul_f32_max_TT_pl, unsigned long long, NEG_INF_F32, MAX_BETTER, A_OFF_T, B_OFF_T, LOAD_A_DECOMP_T, LOAD_B_DECOMP_T)
+DEFINE_TILED_F32_PIPELINED(tropical_matmul_f32_min_NN_pl, unsigned long long, POS_INF_F32, MIN_BETTER, A_OFF_N, B_OFF_N, LOAD_A_DECOMP_N, LOAD_B_DECOMP_N)
+DEFINE_TILED_F32_PIPELINED(tropical_matmul_f32_min_NT_pl, unsigned long long, POS_INF_F32, MIN_BETTER, A_OFF_N, B_OFF_T, LOAD_A_DECOMP_N, LOAD_B_DECOMP_T)
+DEFINE_TILED_F32_PIPELINED(tropical_matmul_f32_min_TN_pl, unsigned long long, POS_INF_F32, MIN_BETTER, A_OFF_T, B_OFF_N, LOAD_A_DECOMP_T, LOAD_B_DECOMP_N)
+DEFINE_TILED_F32_PIPELINED(tropical_matmul_f32_min_TT_pl, unsigned long long, POS_INF_F32, MIN_BETTER, A_OFF_T, B_OFF_T, LOAD_A_DECOMP_T, LOAD_B_DECOMP_T)
+DEFINE_TILED_F64_PIPELINED(tropical_matmul_f64_max_NN_pl, unsigned long long, NEG_INF_F64, MAX_BETTER, A_OFF_N, B_OFF_N, LOAD_A_DECOMP_N, LOAD_B_DECOMP_N)
+DEFINE_TILED_F64_PIPELINED(tropical_matmul_f64_max_NT_pl, unsigned long long, NEG_INF_F64, MAX_BETTER, A_OFF_N, B_OFF_T, LOAD_A_DECOMP_N, LOAD_B_DECOMP_T)
+DEFINE_TILED_F64_PIPELINED(tropical_matmul_f64_max_TN_pl, unsigned long long, NEG_INF_F64, MAX_BETTER, A_OFF_T, B_OFF_N, LOAD_A_DECOMP_T, LOAD_B_DECOMP_N)
+DEFINE_TILED_F64_PIPELINED(tropical_matmul_f64_max_TT_pl, unsigned long long, NEG_INF_F64, MAX_BETTER, A_OFF_T, B_OFF_T, LOAD_A_DECOMP_T, LOAD_B_DECOMP_T)
+DEFINE_TILED_F64_PIPELINED(tropical_matmul_f64_min_NN_pl, unsigned long long, POS_INF_F64, MIN_BETTER, A_OFF_N, B_OFF_N, LOAD_A_DECOMP_N, LOAD_B_DECOMP_N)
+DEFINE_TILED_F64_PIPELINED(tropical_matmul_f64_min_NT_pl, unsigned long long, POS_INF_F64, MIN_BETTER, A_OFF_N, B_OFF_T, LOAD_A_DECOMP_N, LOAD_B_DECOMP_T)
+DEFINE_TILED_F64_PIPELINED(tropical_matmul_f64_min_TN_pl, unsigned long long, POS_INF_F64, MIN_BETTER, A_OFF_T, B_OFF_N, LOAD_A_DECOMP_T, LOAD_B_DECOMP_N)
+DEFINE_TILED_F64_PIPELINED(tropical_matmul_f64_min_TT_pl, unsigned long long, POS_INF_F64, MIN_BETTER, A_OFF_T, B_OFF_T, LOAD_A_DECOMP_T, LOAD_B_DECOMP_T)
+
+// _plu32 = u32 cnt accumulator (gate K·(P-1)² < 2^32). ~1.7× faster than _pl
+// on A100; eliminates IMAD.WIDE.U32 + IMAD.X carry chain in the hot inner loop.
+DEFINE_TILED_F32_PIPELINED(tropical_matmul_f32_max_NN_plu32, unsigned int, NEG_INF_F32, MAX_BETTER, A_OFF_N, B_OFF_N, LOAD_A_DECOMP_N, LOAD_B_DECOMP_N)
+DEFINE_TILED_F32_PIPELINED(tropical_matmul_f32_max_NT_plu32, unsigned int, NEG_INF_F32, MAX_BETTER, A_OFF_N, B_OFF_T, LOAD_A_DECOMP_N, LOAD_B_DECOMP_T)
+DEFINE_TILED_F32_PIPELINED(tropical_matmul_f32_max_TN_plu32, unsigned int, NEG_INF_F32, MAX_BETTER, A_OFF_T, B_OFF_N, LOAD_A_DECOMP_T, LOAD_B_DECOMP_N)
+DEFINE_TILED_F32_PIPELINED(tropical_matmul_f32_max_TT_plu32, unsigned int, NEG_INF_F32, MAX_BETTER, A_OFF_T, B_OFF_T, LOAD_A_DECOMP_T, LOAD_B_DECOMP_T)
+DEFINE_TILED_F32_PIPELINED(tropical_matmul_f32_min_NN_plu32, unsigned int, POS_INF_F32, MIN_BETTER, A_OFF_N, B_OFF_N, LOAD_A_DECOMP_N, LOAD_B_DECOMP_N)
+DEFINE_TILED_F32_PIPELINED(tropical_matmul_f32_min_NT_plu32, unsigned int, POS_INF_F32, MIN_BETTER, A_OFF_N, B_OFF_T, LOAD_A_DECOMP_N, LOAD_B_DECOMP_T)
+DEFINE_TILED_F32_PIPELINED(tropical_matmul_f32_min_TN_plu32, unsigned int, POS_INF_F32, MIN_BETTER, A_OFF_T, B_OFF_N, LOAD_A_DECOMP_T, LOAD_B_DECOMP_N)
+DEFINE_TILED_F32_PIPELINED(tropical_matmul_f32_min_TT_plu32, unsigned int, POS_INF_F32, MIN_BETTER, A_OFF_T, B_OFF_T, LOAD_A_DECOMP_T, LOAD_B_DECOMP_T)
+DEFINE_TILED_F64_PIPELINED(tropical_matmul_f64_max_NN_plu32, unsigned int, NEG_INF_F64, MAX_BETTER, A_OFF_N, B_OFF_N, LOAD_A_DECOMP_N, LOAD_B_DECOMP_N)
+DEFINE_TILED_F64_PIPELINED(tropical_matmul_f64_max_NT_plu32, unsigned int, NEG_INF_F64, MAX_BETTER, A_OFF_N, B_OFF_T, LOAD_A_DECOMP_N, LOAD_B_DECOMP_T)
+DEFINE_TILED_F64_PIPELINED(tropical_matmul_f64_max_TN_plu32, unsigned int, NEG_INF_F64, MAX_BETTER, A_OFF_T, B_OFF_N, LOAD_A_DECOMP_T, LOAD_B_DECOMP_N)
+DEFINE_TILED_F64_PIPELINED(tropical_matmul_f64_max_TT_plu32, unsigned int, NEG_INF_F64, MAX_BETTER, A_OFF_T, B_OFF_T, LOAD_A_DECOMP_T, LOAD_B_DECOMP_T)
+DEFINE_TILED_F64_PIPELINED(tropical_matmul_f64_min_NN_plu32, unsigned int, POS_INF_F64, MIN_BETTER, A_OFF_N, B_OFF_N, LOAD_A_DECOMP_N, LOAD_B_DECOMP_N)
+DEFINE_TILED_F64_PIPELINED(tropical_matmul_f64_min_NT_plu32, unsigned int, POS_INF_F64, MIN_BETTER, A_OFF_N, B_OFF_T, LOAD_A_DECOMP_N, LOAD_B_DECOMP_T)
+DEFINE_TILED_F64_PIPELINED(tropical_matmul_f64_min_TN_plu32, unsigned int, POS_INF_F64, MIN_BETTER, A_OFF_T, B_OFF_N, LOAD_A_DECOMP_T, LOAD_B_DECOMP_N)
+DEFINE_TILED_F64_PIPELINED(tropical_matmul_f64_min_TT_plu32, unsigned int, POS_INF_F64, MIN_BETTER, A_OFF_T, B_OFF_T, LOAD_A_DECOMP_T, LOAD_B_DECOMP_T)

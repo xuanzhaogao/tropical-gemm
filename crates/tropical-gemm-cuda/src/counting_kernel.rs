@@ -21,23 +21,42 @@ fn device_is_sm80_plus(ctx: &CudaContext) -> bool {
         .unwrap_or(false)
 }
 
-/// Spec Q safety: the `_pl` pipelined kernel uses a defer-mod inner loop
-/// (Barrett applied only at write-out). This is correct iff the u64 cnt
-/// accumulator never overflows during the K-reduction. Worst case per
-/// step is `(P-1)^2`; over `K` steps the bound is `K * (P-1)^2`.
-fn defer_mod_safe(p: i32, k: usize) -> bool {
+/// Worst-case raw cnt accumulator value over the K-reduction:
+/// `K * (P-1)^2`. Used by both u32 and u64 defer-mod gates.
+fn defer_mod_bound(p: i32, k: usize) -> u128 {
     if p <= 1 {
-        return true;
+        return 0;
     }
     let pm1 = (p as i64 - 1) as u128;
-    let bound = pm1.saturating_mul(pm1).saturating_mul(k as u128);
-    bound < (1u128 << 63)
+    pm1.saturating_mul(pm1).saturating_mul(k as u128)
 }
 
-/// Pick the pipelined fast path only when both the device supports it
-/// and the (P, K) shape stays inside the defer-mod overflow envelope.
-fn prefer_pipelined(ctx: &CudaContext, p: i32, k: usize) -> bool {
-    device_is_sm80_plus(ctx) && defer_mod_safe(p, k)
+/// Spec R u32 fast path: gate `K·(P-1)² < 2^32`. Strictly faster than
+/// u64 when applicable (~1.7× on A100); requires sm_80+.
+fn defer_mod_u32_safe(p: i32, k: usize) -> bool {
+    defer_mod_bound(p, k) < (1u128 << 32)
+}
+
+/// Spec Q u64 fast path: gate `K·(P-1)² < 2^63`. Falls back to sync
+/// when violated (full Barrett-in-loop, always correct).
+fn defer_mod_u64_safe(p: i32, k: usize) -> bool {
+    defer_mod_bound(p, k) < (1u128 << 63)
+}
+
+/// Pick the kernel suffix variant. Three-way preference:
+/// 1. `_plu32` if sm_80+ and `K·(P-1)² < 2^32` (Spec R, fastest).
+/// 2. `_pl` if sm_80+ and `K·(P-1)² < 2^63` (Spec Q, defer-mod u64).
+/// 3. `""` (sync, Barrett-in-loop, always correct) otherwise.
+fn pick_variant_suffix(ctx: &CudaContext, p: i32, k: usize) -> &'static str {
+    if device_is_sm80_plus(ctx) {
+        if defer_mod_u32_safe(p, k) {
+            return "_plu32";
+        }
+        if defer_mod_u64_safe(p, k) {
+            return "_pl";
+        }
+    }
+    ""
 }
 
 /// Wraps a raw `CUdeviceptr` so it can be passed to `kernel.launch(...)` as a
@@ -109,11 +128,7 @@ where
             "tA/tB must be in {{'N','T'}}, got tA={}, tB={}", tA, tB
         ))),
     };
-    let suffix_with_variant = if prefer_pipelined(ctx, p, k) {
-        format!("{}_pl", suffix)
-    } else {
-        suffix.to_string()
-    };
+    let suffix_with_variant = format!("{}{}", suffix, pick_variant_suffix(ctx, p, k));
     let kernel_name_owned: String = format!(
         "{}_{}",
         <(T, D) as TropicalMatmulKernelName<T, D>>::BASE_NAME,
@@ -187,26 +202,36 @@ impl TropicalMatmulKernelName<f64, tropical_gemm::types::Min> for (f64, tropical
 
 #[cfg(test)]
 mod gate_tests {
-    use super::defer_mod_safe;
+    use super::{defer_mod_u32_safe, defer_mod_u64_safe};
 
     #[test]
-    fn small_p_always_safe() {
-        assert!(defer_mod_safe(7, 4096));
-        assert!(defer_mod_safe(7, 1 << 30));
-        assert!(defer_mod_safe(65535, 1 << 30));
+    fn small_p_picks_u32() {
+        assert!(defer_mod_u32_safe(7, 4096));
+        assert!(defer_mod_u32_safe(7, 1 << 25));   // 7·36 = 252 << 2^32
+        assert!(defer_mod_u64_safe(7, 1 << 25));
     }
 
     #[test]
-    fn large_p_blocks_long_k() {
-        // P near 2^31: (P-1)^2 ≈ 2^62, so any K > 2 trips the gate.
+    fn medium_p_picks_u64_only() {
+        // 22-bit prime: (P-1)^2 ≈ 2^44, so any K ≥ 1 trips u32 gate.
+        let p = 2_965_819i32;
+        assert!(!defer_mod_u32_safe(p, 1));
+        assert!(defer_mod_u64_safe(p, 1 << 18));   // (P-1)²≈2^43; 2^43·2^18 = 2^61
+        assert!(!defer_mod_u64_safe(p, 1 << 21));  // 2^43·2^21 = 2^64 ≥ 2^63
+    }
+
+    #[test]
+    fn large_p_falls_through_to_sync() {
+        // P near 2^31 trips both gates beyond very tiny K.
         let p = i32::MAX;
-        assert!(!defer_mod_safe(p, 16));
-        assert!(!defer_mod_safe(p, 4096));
+        assert!(!defer_mod_u32_safe(p, 16));
+        assert!(!defer_mod_u64_safe(p, 16));
     }
 
     #[test]
-    fn p_at_or_below_one_is_safe() {
-        assert!(defer_mod_safe(0, 1 << 30));
-        assert!(defer_mod_safe(1, 1 << 30));
+    fn p_at_or_below_one_is_safe_for_both() {
+        assert!(defer_mod_u32_safe(0, 1 << 30));
+        assert!(defer_mod_u32_safe(1, 1 << 30));
+        assert!(defer_mod_u64_safe(0, 1 << 30));
     }
 }

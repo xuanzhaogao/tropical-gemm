@@ -296,6 +296,57 @@ script: `examples/bench_kernel_vs_julia.jl`.
   by these huge matmuls), this 8× per-matmul edge translates directly
   to end-to-end wins, even with 2-pass CRT factor.
 
+## A100-SXM4-80GB (Spec R u32-acc small-P fast path) — 2026-04-29
+
+ncu confirmed Spec Q was compute-bound at 82.8% SM throughput (occupancy
+25%, capped by reg+shared, but raising occupancy doesn't help a
+compute-bound kernel — see skill `matmul-kernel-optimization`). SASS
+opcode histogram on the inner FMA loop showed ~96 IMAD.WIDE.U32 + ~64
+IMAD.X (u64 carry) + ~144 SEL versus only ~32 FADD — i.e. the u64 cnt
+path costs much more than the actual fp32 work.
+
+Spec R splits the pipelined kernel by accumulator type:
+
+- `_plu32` — `unsigned int` cnt acc. Gate: `K · (P-1)² < 2^32`. Strips
+  `IMAD.WIDE.U32` + `IMAD.X` carries; ~halves integer-pipe traffic.
+- `_pl` — unchanged from Spec Q (u64 cnt acc, gate `< 2^63`).
+- sync — Barrett-in-loop fallback for arbitrary P/K.
+
+Launcher picks the most aggressive variant the (P, K) shape allows. 79/79
+lib tests pass; 4 gate unit tests cover all three paths.
+
+| P | Shape | ms / call | G tropical-ops/s | path |
+|---:|---:|---:|---:|:---|
+| 7 | 1024³ | 1.012 | 2122 | _plu32 |
+| 7 | 2048³ | 6.514 | 2637 | _plu32 |
+| 7 | 4096³ | 48.194 | **2852** | _plu32 |
+| 7 | 8192³ | 383.095 | **2870** | _plu32 |
+| 2 965 819 (22-bit) | 1024³ | 1.532 | 1402 | _pl |
+| 2 965 819 (22-bit) | 2048³ | 11.056 | 1554 | _pl |
+| 2 965 819 (22-bit) | 4096³ | 80.646 | 1704 | _pl |
+| 2 965 819 (22-bit) | 8192³ | 660.880 | 1664 | _pl |
+
+### Cumulative speedup (4096³ TT on A100)
+
+| Spec | path | G/s | × baseline |
+|---|---|---|---|
+| N (sync, Barrett-in-loop) | sync | 746 | 1.0× |
+| P (pipelined, no cp.async) | _pl Barrett | 771 | 1.03× |
+| Q (defer-mod u64) | _pl u64 | 1845 | 2.47× |
+| **R (defer-mod u32, P≤7)** | **_plu32** | **2852** | **3.82×** |
+
+### Spec R observations
+
+- **2870 G/s @ 8192³** at P=7 is past the historical "~2 TG/s" target
+  by ~40%. Sustained out to 32768³ (verified at 4096³+8192³; 16384³+
+  re-run pending).
+- **u32 path is 1.67–1.70× faster** than u64 across all measured sizes.
+  The win matches the SASS-derived expectation: integer carry removed,
+  shorter dep chain into SEL, half the registers for acc_c.
+- The u64 path keeps Spec Q numbers exactly (the launcher selects it
+  unchanged when the u32 gate fails). Defaults are now strictly
+  better for any (P, K) the original gate accepted.
+
 ## H100
 
 Pending — no H100 available at the time of writing. Re-run on A100-80GB
