@@ -193,7 +193,7 @@ extern "C" __global__ void NAME(                                               \
     int M, int N, int K, int P, unsigned long long MU                          \
 )                                                                              \
 TROPICAL_MATMUL_TILED_BODY(float, PairF32, INIT_VAL, BETTER, A_OFF, B_OFF,     \
-                           LOAD_A, LOAD_B, 64, 64, 8, 4, 4)
+                           LOAD_A, LOAD_B, 64, 64, 32, 4, 4)
 
 #define DEFINE_TILED_F64(NAME, INIT_VAL, BETTER, A_OFF, B_OFF, LOAD_A, LOAD_B) \
 extern "C" __global__ void NAME(                                               \
